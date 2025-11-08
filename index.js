@@ -902,6 +902,51 @@ async function disponibilidadPorDias({ tipo, desdeISO, dias = 30, maxSlotsPorDia
 }
 
 
+const MONTHS_ES = {
+  enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,
+  julio:7,agosto:8,septiembre:9,setiembre:9,octubre:10,noviembre:11,diciembre:12,
+  ene:1,feb:2,mar:3,abr:4,may:5,jun:6,jul:7,ago:8,sep:9,set:9,oct:10,nov:11,dic:12
+};
+
+function parseUserDate(text) {
+  if (!text) return null;
+  const s = text.toLowerCase();
+  // YYYY-MM-DD
+  const m1 = s.match(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/);
+  if (m1) return `${m1[1]}-${String(m1[2]).padStart(2,'0')}-${String(m1[3]).padStart(2,'0')}`;
+  // dd/mm/yyyy
+  const m2 = s.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](20\d{2})\b/);
+  if (m2) return `${m2[3]}-${String(m2[2]).padStart(2,'0')}-${String(m2[1]).padStart(2,'0')}`;
+  // “27 de noviembre” (+ año actual)
+  const m3 = s.match(/\b(\d{1,2})\s+de\s+([a-záéíóú\.]{3,})\b/);
+  if (m3 && MONTHS_ES[m3[2].replace(/\./g,'')]) {
+    const y = DateTime.now().setZone(ZONE).year;
+    const mm = String(MONTHS_ES[m3[2].replace(/\./g,'')]).padStart(2,'0');
+    const dd = String(m3[1]).padStart(2,'0');
+    return `${y}-${mm}-${dd}`;
+  }
+  return null;
+}
+
+function extractHour(text) {
+  if (!text) return null;
+  const s = text.toLowerCase().replace(/\s+/g,' ');
+  // 24h HH:mm
+  const m1 = s.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+  if (m1) return `${String(m1[1]).padStart(2,'0')}:${m1[2]}`;
+  // 12h hh:mm am/pm
+  const m2 = s.match(/\b(1[0-2]|0?\d):([0-5]\d)\s*([ap]\.?m\.?)\b/);
+  if (m2) {
+    let h = parseInt(m2[1],10);
+    const mm = m2[2];
+    const ampm = m2[3].replace(/\./g,'');
+    if (ampm.startsWith('p') && h !== 12) h += 12;
+    if (ampm.startsWith('a') && h === 12) h = 0;
+    return `${String(h).padStart(2,'0')}:${mm}`;
+  }
+  return null;
+}
+
 async function showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom) {
   const pol  = _monthPolicyFrom(_firstAllowedStart(now).toISODate());
   if (pol.blocked) {
@@ -924,6 +969,7 @@ async function showAvailabilityNow(session, now, _firstAllowedStart, _monthPolic
   }).join('\n');
   return `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
 }
+
 
 async function alternativasCercanas({ tipo, desdeISO, dias = 10, limite = 6 }) {
   const lista = await disponibilidadPorDias({ tipo, desdeISO, dias, maxSlotsPorDia: limite });
@@ -2873,23 +2919,6 @@ async function handleLLMFailureAndDisableChat(jid, err){
   }
 }
 
-function parseUserDate(text) {
-  if (!text) return null;
-  const t = text.trim();
-
-  // YYYY-MM-DD
-  const m1 = t.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
-  if (m1) return `${m1[1]}-${m1[2]}-${m1[3]}`;
-
-  // dd/mm/yyyy
-  const m2 = t.match(/\b(\d{1,2})\/(\d{1,2})\/(20\d{2})\b/);
-  if (m2) {
-    const dd = String(m2[1]).padStart(2,'0');
-    const mm = String(m2[2]).padStart(2,'0');
-    return `${m2[3]}-${mm}-${dd}`;
-  }
-  return null;
-}
 
 
 // ============== /chat (lógica IA por sesión) ==============
@@ -3051,31 +3080,16 @@ const firstTimeNote =
   // Tomar datos del mensaje actual para ir llenando session.patient
 collectPatientFields(session, userMsg);
 
-// Si es PRIMERA VEZ → obliga a pedir los faltantes ANTES de disponibilidad/agendar
-const tipoEfectivo = session.tipoActual || guessTipo?.(userMsg) || '';
-if (/primera\s*vez/i.test(tipoEfectivo)) {
-  const faltan = missingForTipo(session, 'Primera vez');
-  if (faltan.length) {
-    const plantilla =
-`NOMBRES Y APELLIDOS COMPLETOS: 
- NUMERO DE CEDULA:
- FECHA DE NANCIMIENTO:
- TIPO DE SANGRE: 
- ESTADO CIVIL: 
- DIRECCION Y CIUDAD DE RESIDENCIA: 
- CORREO ELECTRONICO: 
- NUMERO DE CELULAR DEL PACIENTE:
- ENTIDAD DE SALUD: 
- CONFIRMAR SI TRAE ESTUDIOS PREVIOS CUANDO Y DONDE SE LOS REALIZO: `;
-
-    // instrucción dura al LLM para que pida SOLO esto
-    session.history.push({
-      role: 'system',
-      content: `FALTAN CAMPOS OBLIGATORIOS PARA "Primera vez": ${faltan.join(', ')}. 
-Pide ÚNICAMENTE esos campos en una sola lista y no avances a disponibilidad ni a crear cita hasta tenerlos todos. No confirmes nada.`
-    });
-    session.history.push({ role: 'system', content: `Usa exactamente esta plantilla:\n${plantilla}` });
-  }
+// ✅ Si ya está completo el núcleo de "Primera vez", NO volver a pedirlo
+if (/primera\s*vez/i.test(tipoEfectivo) && missingForTipo(session, 'Primera vez').length === 0) {
+  console.log('[PV] Núcleo COMPLETO para "Primera vez". No volver a pedir datos.');
+  session.history.push({
+    role: 'system',
+    content: 'Ya tengo TODOS los datos obligatorios del paciente para "Primera vez". NO los pidas de nuevo.'
+  });
+  // Flag para un auto-siguiente paso (mostrar disponibilidad)
+  session.flags = session.flags || {};
+  session.flags.firstTimeCoreReady = true;
 }
 
   
@@ -3178,25 +3192,41 @@ if (cancelIntent) {
     const auto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
     reply = `He tomado tus datos. Pasemos a revisar la disponibilidad…\n\n${auto}`;
    } else if (daySlots) {
-    if (!daySlots.slots.length) {
-      reply = `Para ${fmtFechaHumana(daySlots.fecha)} no hay cupos válidos. ¿Quieres otra fecha?`;
-    } else {
-      const fechaTxt = fmtFechaHumana(daySlots.fecha);
-      const horas = daySlots.slots.map(s => fmtHoraHumana(s.inicio)).join(', ');
-      reply = `Disponibilidad de citas — ${fechaTxt}:\n${horas}\n\n¿Te sirve alguna? Responde con la hora exacta (ej. "8:15").`;
-    }
-   } else if (daysResp) {
-    if (!daysResp.dias_disponibles.length) {
-      reply = `No tengo cupos en los próximos ${daysResp.dias} días. ¿Probamos otro rango?`;
-    } else {
-      const lineas = daysResp.dias_disponibles.map(d => {
-        const fecha = fmtFechaHumana(d.fecha);
-        const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
-        return `- ${fecha}: ${horas}`;
-      }).join('\n');
-      reply = `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
-    }
-   }
+  if (!daySlots.slots.length) {
+    reply = `Para ${fmtFechaHumana(daySlots.fecha)} no hay cupos válidos. ¿Quieres otra fecha?`;
+  } else {
+    const fechaTxt = fmtFechaHumana(daySlots.fecha);
+    const horas = daySlots.slots.map(s => fmtHoraHumana(s.inicio)).join(', ');
+    reply = `Disponibilidad de citas — ${fechaTxt}:\n${horas}\n\n¿Te sirve alguna? Responde con la hora exacta (ej. "8:15").`;
+  }
+  // ⬇️ Guardar oferta
+  session.lastOffered = {
+    tipo: session.tipoActual || 'Control presencial',
+    days: [{ fechaISO: daySlots.fecha, slots: (daySlots.slots||[]).map(s => ({ inicio: s.inicio, fin: s.fin })) }],
+    singleDay: true
+  };
+
+} else if (daysResp) {
+  if (!daysResp.dias_disponibles.length) {
+    reply = `No tengo cupos en los próximos ${daysResp.dias} días. ¿Probamos otro rango?`;
+  } else {
+    const lineas = daysResp.dias_disponibles.map(d => {
+      const fecha = fmtFechaHumana(d.fecha);
+      const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
+      return `- ${fecha}: ${horas}`;
+    }).join('\n');
+    reply = `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
+  }
+  // ⬇️ Guardar oferta
+  session.lastOffered = {
+    tipo: session.tipoActual || 'Control presencial',
+    days: (daysResp.dias_disponibles || []).map(d => ({
+      fechaISO: d.fecha, slots: (d.slots||[]).map(s => ({ inicio: s.inicio, fin: s.fin }))
+    })),
+    singleDay: (daysResp.dias_disponibles || []).length === 1
+  };
+}
+
 
    reply = (reply || '').trim();
    if (!reply) reply = 'Listo ✅';
@@ -3250,6 +3280,105 @@ if (!actionResult?.handled && dateWanted) {
     console.error('❌ Auto-disponibilidad por día error:', e);
   }
 }
+
+// === AUTO-CREAR SI EL USUARIO ELIGE UN HORARIO DE LOS ÚLTIMOS OFRECIDOS ===
+if (!actionResult?.handled && session.lastOffered && session.lastOffered.days?.length) {
+  const hhmm = extractHour(userMsg);
+  const dateFromMsg = parseUserDate(userMsg);
+
+  // Determinar fecha candidata
+  let chosenDay = null;
+  if (dateFromMsg) {
+    chosenDay = session.lastOffered.days.find(d => d.fechaISO === dateFromMsg);
+  } else if (session.lastOffered.singleDay) {
+    chosenDay = session.lastOffered.days[0];
+  }
+
+  // Si tenemos fecha y hora, buscar el slot
+  if (chosenDay && hhmm) {
+    const slot = (chosenDay.slots || []).find(s => {
+      const h = DateTime.fromISO(s.inicio, { zone: ZONE }).toFormat('HH:mm');
+      return h === hhmm;
+    });
+
+    if (slot) {
+      // Validar núcleo (nombre, cédula, entidad_salud, correo, celular, dirección, ciudad)
+      const P = session.patient || {};
+      const core = ['nombre','cedula','entidad_salud','correo','celular','direccion','ciudad'];
+      const missingCore = core.filter(k => !String(P[k]||'').trim());
+      if (missingCore.length) {
+        reply = `Antes de agendar necesito: ${missingCore.join(', ')}. Por favor envíalos en un solo mensaje.`;
+      } else {
+        // Construir acción crear_cita y ejecutarla por la misma ruta
+        const payload = {
+          action: 'crear_cita',
+          data: {
+            nombre: P.nombre,
+            cedula: P.cedula,
+            entidad_salud: P.entidad_salud,
+            correo: P.correo,
+            celular: P.celular,
+            direccion: P.direccion,
+            ciudad: P.ciudad,
+            tipo: session.tipoActual || 'Control presencial',
+            inicio: slot.inicio,
+            fin: slot.fin
+          }
+        };
+        const block = '```action\n' + JSON.stringify(payload, null, 2) + '\n```';
+        const autoRes = await maybeHandleAssistantAction(block, session);
+
+        if (autoRes?.handled && autoRes.makeResponse) {
+          const mr = Array.isArray(autoRes.makeResponse) ? autoRes.makeResponse : [autoRes.makeResponse];
+          const created = mr.find(x => x && x.ok === true && (x.eventId || x.confirmText));
+
+          if (created) {
+            // armar confirmación (mismo formato que ya usas)
+            if (created.confirmText) {
+              reply = created.confirmText;
+            } else {
+              const df = DateTime.fromISO(created.inicio || slot.inicio, { zone: ZONE }).setLocale('es');
+              const fechaTxt = df.isValid ? df.toFormat("d 'de' LLLL") : 'la fecha indicada';
+              const horaTxt  = df.isValid ? df.toFormat('HH:mm') : 'la hora indicada';
+              reply = `Tu cita ha sido agendada exitosamente para el ${fechaTxt} a las ${horaTxt} ` +
+                      `en la Clínica Portoazul, piso 7, consultorio 707, en Barranquilla. ` +
+                      `Por favor, llega con 15 minutos de anticipación y lleva todos los reportes previos impresos.\n\n` +
+                      `Recuerda que está prohibido grabar audio o video durante la consulta sin autorización. ` +
+                      `Cualquier inquietud adicional, no dudes en contactarnos.`;
+            }
+            console.log('[AUTO-CREATE] Cita creada desde selección de usuario.');
+            session.history.push({ role: 'assistant', content: reply });
+            capHistory(session);
+            touchSession(session);
+            return res.json({ reply, makeResponse: autoRes.makeResponse });
+          }
+        }
+      }
+    }
+  }
+}
+
+// 🔁 AUTO-DISPONIBILIDAD cuando es "Primera vez" y ya tengo núcleo
+if (
+  !actionResult?.handled &&
+  /primera\s*vez/i.test(session.tipoActual || '') &&
+  missingForTipo(session, 'Primera vez').length === 0 &&
+  !session.lastOffered // para no repetir si ya ofrecimos
+) {
+  try {
+    const replyAuto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
+    // Guardamos la última oferta en session.lastOffered dentro de showAvailabilityNow
+    console.log('[AUTO-DISPONIBILIDAD] Primera vez con núcleo completo → mostrando cupos');
+    session.history.push({ role: 'assistant', content: replyAuto });
+    capHistory(session); touchSession(session);
+    // Evitar que se dispare de nuevo en el mismo hilo
+    session.flags.firstTimeCoreReady = false;
+    return res.json({ reply: replyAuto, makeResponse: null });
+  } catch (e) {
+    console.error('❌ Auto-disponibilidad falló:', e);
+  }
+}
+
 
 
     // Fallback: si pidió disponibilidad en texto libre

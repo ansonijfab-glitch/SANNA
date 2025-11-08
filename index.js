@@ -901,6 +901,30 @@ async function disponibilidadPorDias({ tipo, desdeISO, dias = 30, maxSlotsPorDia
   return out;
 }
 
+
+async function showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom) {
+  const pol  = _monthPolicyFrom(_firstAllowedStart(now).toISODate());
+  if (pol.blocked) {
+    return `No agendamos esta semana. La agenda del mes está detenida desde el día ${_MONTH_CUTOFF_DAY}. ` +
+           `Vuelve a escribir a partir del ${pol.nextMonthStart.setLocale('es').toFormat("d 'de' LLLL")}.`;
+  }
+  const desde = pol.start.toISODate();
+  const tipo  = session.tipoActual || 'Control presencial';
+  const dias  = pol.diasMax;
+
+  const diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias });
+  if (!diasDisp.length) {
+    return `No tengo cupos en ${pol.start.setLocale('es').toFormat('LLLL')}. ` +
+           `¿Deseas intentar con otro tipo de cita (p. ej., **Control virtual** el viernes tarde)?`;
+  }
+  const lineas = diasDisp.map(d => {
+    const fecha = fmtFechaHumana(d.fecha);
+    const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
+    return `- ${fecha}: ${horas}`;
+  }).join('\n');
+  return `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
+}
+
 async function alternativasCercanas({ tipo, desdeISO, dias = 10, limite = 6 }) {
   const lista = await disponibilidadPorDias({ tipo, desdeISO, dias, maxSlotsPorDia: limite });
   const planos = [];
@@ -2849,11 +2873,29 @@ async function handleLLMFailureAndDisableChat(jid, err){
   }
 }
 
+function parseUserDate(text) {
+  if (!text) return null;
+  const t = text.trim();
+
+  // YYYY-MM-DD
+  const m1 = t.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
+  if (m1) return `${m1[1]}-${m1[2]}-${m1[3]}`;
+
+  // dd/mm/yyyy
+  const m2 = t.match(/\b(\d{1,2})\/(\d{1,2})\/(20\d{2})\b/);
+  if (m2) {
+    const dd = String(m2[1]).padStart(2,'0');
+    const mm = String(m2[2]).padStart(2,'0');
+    return `${m2[3]}-${mm}-${dd}`;
+  }
+  return null;
+}
+
 
 // ============== /chat (lógica IA por sesión) ==============
 app.post('/chat', async (req, res) => {
   
- const from = normJid(String(req.body.from || 'anon'));
+  const from = normJid(String(req.body.from || 'anon'));
   const userMsg = String(req.body.message || '').trim();
 
   // 1) OBTÉN SESIÓN Y NOW ANTES DE USARLA EN CUALQUIER BLOQUE
@@ -2985,12 +3027,13 @@ if (session.priority?.active) {
     'No confirmes citas en el texto visible hasta que el sistema te devuelva confirmación.';
 
   // Reglas duras de datos para "Primera vez"
-const strictDataNote =
-  'Si el motivo es "Primera vez": ANTES de consultar disponibilidad o crear cita, ' +
-  'exige estos campos y valida que estén TODOS presentes: ' +
-  'nombre completo, cédula, fecha de nacimiento (YYYY-MM-DD o dd/mm/aaaa), ' +
-  'tipo de sangre (A+, A-, B+, B-, AB+, AB-, O+, O-), estado civil, correo, celular, dirección y ciudad, y entidad de salud. ' +
-  'Si falta cualquiera, responde pidiéndolos en un SOLO mensaje y NO emitas acciones.';
+// Reglas de datos para "Primera vez" (permisivas)
+const firstTimeNote =
+  'Si el motivo es "Primera vez": pide TODOS los datos en UN SOLO mensaje (usa la plantilla), ' +
+  'pero **sí puedes consultar disponibilidad** aunque falte alguno. ' +
+  'Solo BLOQUEA al **crear_cita** si falta un campo del núcleo: ' +
+  'nombre completo, cédula, entidad_salud, correo, celular, dirección y ciudad. ' +
+  'Los campos “señuelo” (fecha de nacimiento, tipo de sangre, estado civil) no bloquean.';
 
     
 
@@ -2998,7 +3041,7 @@ const strictDataNote =
   session.history.push({ role: 'system', content: policyNote });
   session.history.push({ role: 'system', content: epsNote });
   session.history.push({ role: 'system', content: actionNote });
-  session.history.push({ role: 'system', content: strictDataNote });
+  session.history.push({ role: 'system', content: firstTimeNote });
 
   // Fijar tipo por mensaje explícito y guardar último texto
   const explicitTipo = guessTipo(userMsg);
@@ -3132,8 +3175,8 @@ if (cancelIntent) {
         (created.htmlLink ? `\n\nAbrir en Google Calendar: ${created.htmlLink}` : '');
     }
    } else if (saved) {
-    // (Tu lógica de saved → disponibilidad, si aplica)
-    reply = 'He tomado tus datos. Pasemos a revisar la disponibilidad…';
+    const auto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
+    reply = `He tomado tus datos. Pasemos a revisar la disponibilidad…\n\n${auto}`;
    } else if (daySlots) {
     if (!daySlots.slots.length) {
       reply = `Para ${fmtFechaHumana(daySlots.fecha)} no hay cupos válidos. ¿Quieres otra fecha?`;
@@ -3167,10 +3210,47 @@ if (cancelIntent) {
    return res.json({ reply, makeResponse: actionResult.makeResponse });
    }
 
+
+   // Si el modelo "prometió" consultar pero NO mandó acción JSON → mostrar disponibilidad
+const promisedToCheck =
+  /consultar[ée]? la disponibilidad|voy a consultar la disponibilidad|un momento,\s*por favor/i.test(replyRaw);
+
+if (!actionResult?.handled && promisedToCheck) {
+  try {
+    const auto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
+    reply = auto;
+    console.log('[AUTO-DISPONIBILIDAD] sin acción JSON → enviada');
+  } catch (e) {
+    console.error('❌ Auto-disponibilidad error:', e);
+  }
+}
+
+
+
     // Si el modelo “dice” que ya agendó pero no hubo acción real → frenar
     if (looksLikeFakeConfirmation(reply)) {
       reply = 'Aún no he registrado la cita. Indícame la **fecha** y la **hora exacta** (por ejemplo, "2025-11-19 15:15") o elige una opción de la disponibilidad.';
     }
+
+    // Si el usuario envió una fecha explícita (YYYY-MM-DD o dd/mm/yyyy)
+const dateWanted = parseUserDate(userMsg);
+if (!actionResult?.handled && dateWanted) {
+  try {
+    const tipo = session.tipoActual || 'Control presencial';
+    const day = await disponibilidadPorDias({ tipo, desdeISO: dateWanted, dias: 1 });
+
+    if (!day.length || !(day[0].slots || []).length) {
+      reply = `Para ${fmtFechaHumana(dateWanted)} no hay cupos válidos. ¿Quieres otra fecha?`;
+    } else {
+      const horas = day[0].slots.map(s => fmtHoraHumana(s.inicio)).join(', ');
+      reply = `Disponibilidad de citas — ${fmtFechaHumana(dateWanted)}:\n${horas}\n\n¿Te sirve alguna? Responde con la hora exacta (ej. "8:15").`;
+    }
+    console.log('[AUTO-DISPONIBILIDAD-DÍA] fecha del usuario → enviada');
+  } catch (e) {
+    console.error('❌ Auto-disponibilidad por día error:', e);
+  }
+}
+
 
     // Fallback: si pidió disponibilidad en texto libre
     const u = userMsg.toLowerCase();

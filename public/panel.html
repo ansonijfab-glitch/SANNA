@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Panel WhatsApp • Bot Citas</title>
+<style>
+  :root { --bg:#0b1320; --card:#121b2e; --muted:#9bb1d0; --text:#e6eefb; --accent:#4da3ff; --danger:#ff5c5c; }
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,Segoe UI,Roboto}
+  header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:#0d1730;border-bottom:1px solid #1f2c49}
+  h1{font-size:16px;margin:0}
+  .wrap{display:grid;grid-template-columns:310px 1fr;gap:12px;height:calc(100vh - 56px);padding:12px}
+  .card{background:var(--card);border:1px solid #1c2a45;border-radius:14px;overflow:hidden}
+  .left{display:flex;flex-direction:column}
+  .search{padding:10px;border-bottom:1px solid #1f2c49}
+  .search input{width:100%;padding:8px 10px;border-radius:10px;border:1px solid #223355;background:#0e1830;color:var(--text)}
+  .chatlist{overflow:auto}
+  .chat{padding:10px 12px;border-bottom:1px solid #1a2744;cursor:pointer}
+  .chat:hover{background:#0f1a33}
+  .jid{font-size:12px;color:var(--muted)}
+  .right{display:grid;grid-template-rows:auto 1fr auto}
+  .toolbar{display:flex;align-items:center;gap:8px;padding:10px;border-bottom:1px solid #1f2c49}
+  .toolbar button,.toolbar label{background:#132241;border:1px solid #203257;color:var(--text);padding:8px 10px;border-radius:10px;cursor:pointer}
+  .toolbar input[type="checkbox"]{transform:translateY(1px)}
+  .messages{overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
+  .msg{max-width:70%;padding:8px 10px;border-radius:12px;border:1px solid #203257;background:#0f1d39}
+  .me{align-self:flex-end;background:#0b2a59;border-color:#1d3a6d}
+  .meta{font-size:11px;color:var(--muted);margin-top:4px}
+  .composer{display:flex;gap:8px;padding:10px;border-top:1px solid #1f2c49}
+  .composer input{flex:1;padding:10px;border-radius:10px;border:1px solid #223355;background:#0e1830;color:var(--text)}
+  .composer button{padding:10px 12px;border-radius:10px;border:1px solid #203257;background:var(--accent);color:#00122b;cursor:pointer}
+  .pill{padding:2px 8px;border-radius:999px;background:#0d2750;border:1px solid #1f3b77;font-size:12px}
+  .pill.off{background:#2a0e0e;border-color:#4a1a1a;color:#ffb8b8}
+</style>
+</head>
+<body>
+<header>
+  <h1>Panel WhatsApp • Bot de Citas</h1>
+  <div>
+    <label class="pill" id="globalLabel">
+      <input type="checkbox" id="globalToggle"/> IA Global
+    </label>
+    <button id="relinkBtn" title="Forzar re-vinculación (QR)">Re-vincular</button>
+  </div>
+</header>
+<div class="wrap">
+  <div class="left card">
+    <div class="search"><input id="search" placeholder="Buscar número o nombre"/></div>
+    <div class="chatlist" id="chatlist"></div>
+  </div>
+  <div class="right card">
+    <div class="toolbar">
+      <div id="chatTitle">Selecciona un chat</div>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <label class="pill" id="chatLabel">
+          <input type="checkbox" id="chatToggle"/> IA en este chat
+        </label>
+      </div>
+    </div>
+    <div class="messages" id="messages"></div>
+    <div class="composer">
+      <input id="composerInput" placeholder="Escribe un mensaje manual... (no usa IA)"/>
+      <button id="sendBtn">Enviar</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = sel => document.querySelector(sel);
+let state = { aiGlobalEnabled: true, aiDisabledChats: [] };
+let chats = [];
+let currentJid = null;
+let pollTimer = null;
+
+function fmtTime(ts){ try{ return new Date(ts).toLocaleString(); }catch{ return ''; } }
+
+async function fetchState(){
+  const r = await fetch('/api/panel/state');
+  state = await r.json();
+  const g = $('#globalToggle');
+  g.checked = !!state.aiGlobalEnabled;
+  $('#globalLabel').className = 'pill' + (g.checked ? '' : ' off');
+}
+
+async function patchGlobal(enabled){
+  await fetch('/api/panel/toggle-ai-global', {
+    method:'PATCH', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ enabled })
+  });
+  fetchState(); fetchChats(); fetchMessages();
+}
+
+async function fetchChats(){
+  const r = await fetch('/api/panel/chats');
+  const data = await r.json();
+  chats = data.chats || [];
+  renderChatList($('#search').value || '');
+}
+
+function renderChatList(filter){
+  const list = document.querySelector('#chatlist');
+  const f = (filter||'').toLowerCase();
+  list.innerHTML = '';
+  for (const c of chats){
+    if (f && !c.jid.toLowerCase().includes(f) && !String(c.name||'').toLowerCase().includes(f)) continue;
+    const div = document.createElement('div'); div.className='chat';
+    div.innerHTML = `
+      <div><strong>${c.name || c.jid}</strong> <span class="jid">(${c.jid})</span></div>
+      <div style="display:flex;justify-content:space-between;gap:8px">
+        <div class="jid" style="max-width:70%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${c.lastText || ''}</div>
+        <div class="jid">${fmtTime(c.lastTs)}</div>
+      </div>
+      <div class="jid">IA: ${c.aiEnabled ? 'ON' : 'OFF'} • ${c.messagesCount} mensajes</div>`;
+    div.onclick = ()=> openChat(c.jid);
+    list.appendChild(div);
+  }
+}
+
+async function openChat(jid){ currentJid = jid; await fetchMessages(); }
+
+async function fetchMessages(){
+  if (!currentJid){ document.querySelector('#chatTitle').innerHTML='Selecciona un chat'; document.querySelector('#messages').innerHTML=''; return; }
+  const r = await fetch('/api/panel/messages?jid=' + encodeURIComponent(currentJid));
+  const data = await r.json();
+  document.querySelector('#chatTitle').innerHTML = `<strong>${data.name}</strong> <span class="jid">(${data.jid})</span>`;
+  const t = document.querySelector('#chatToggle');
+  const enabled = !!data.aiEnabled; t.checked = enabled;
+  document.querySelector('#chatLabel').className = 'pill' + (enabled ? '' : ' off');
+
+  const cont = document.querySelector('#messages'); cont.innerHTML='';
+  for (const m of (data.messages||[])){
+    const el = document.createElement('div');
+    el.className = 'msg' + (m.fromMe ? ' me' : '');
+    el.innerHTML = `<div>${m.text || ''}</div><div class="meta">${m.fromMe ? 'Tú' : 'Contacto'} • ${fmtTime(m.ts)}</div>`;
+    cont.appendChild(el);
+  }
+  cont.scrollTop = cont.scrollHeight;
+}
+
+async function patchChatToggle(jid, enabled){
+  await fetch('/api/panel/toggle-ai-chat', {
+    method:'PATCH', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ jid, enabled })
+  });
+  fetchChats(); fetchMessages();
+}
+
+async function sendManual(){
+  const inp = document.querySelector('#composerInput');
+  const txt = (inp.value||'').trim();
+  if (!txt || !currentJid) return;
+  await fetch('/api/panel/send', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ jid: currentJid, text: txt })
+  });
+  inp.value=''; fetchMessages();
+}
+
+document.querySelector('#globalToggle').addEventListener('change', e => patchGlobal(e.target.checked));
+document.querySelector('#chatToggle').addEventListener('change', e => currentJid && patchChatToggle(currentJid, e.target.checked));
+document.querySelector('#sendBtn').addEventListener('click', sendManual);
+document.querySelector('#composerInput').addEventListener('keydown', e => { if(e.key==='Enter') sendManual(); });
+document.querySelector('#search').addEventListener('input', e => renderChatList(e.target.value));
+document.querySelector('#relinkBtn').addEventListener('click', async ()=>{
+  if (!confirm('¿Re-vincular y mostrar nuevo QR?')) return;
+  await fetch('/api/panel/relink', { method:'POST' });
+  alert('Listo, revisa la consola para el nuevo QR.');
+});
+
+async function boot(){
+  await fetchState(); await fetchChats();
+  setInterval(async()=>{ await fetchChats(); await fetchMessages(); }, 3000);
+}
+boot();
+</script>
+</body></html>

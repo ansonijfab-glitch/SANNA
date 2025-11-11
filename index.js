@@ -68,6 +68,8 @@ const MIN_BOOKING_DATE_ISO = '2025-11-12'; // desde el 12 de noviembre en adelan
 const MONTH_CUTOFF_DAY = 24; // desde este día se cierra la agenda del mes actual
 const DEFAULT_RANGE_DAYS = 18;
 const PRIORITY_SEND_TO_ALL_STAFF = true;   
+// Permite buscar X días hacia adelante (cruza meses)
+const LOOKAHEAD_DAYS = parseInt(process.env.LOOKAHEAD_DAYS || '60', 10);
 
 const PRIORITY_LOCK_MINUTES = parseInt(process.env.PRIORITY_LOCK_MINUTES || '60', 10);
 
@@ -2975,20 +2977,27 @@ app.post('/chat', async (req, res) => {
       };
 
   const _monthPolicyFrom = (typeof monthPolicyFrom === 'function')
-    ? monthPolicyFrom
-    : function(desdeISO) {
-        let start = DateTime.fromISO(desdeISO || '', { zone: ZONE });
-        if (!start.isValid) start = _firstAllowedStart(now);
-        const minStart = _firstAllowedStart(now);
-        if (start < minStart) start = minStart;
+  ? monthPolicyFrom
+  : function(desdeISO) {
+      let start = DateTime.fromISO(desdeISO || '', { zone: ZONE });
+      if (!start.isValid) start = _firstAllowedStart(now);
 
-        const endOfMonth     = start.endOf('month').startOf('day');
-        const blocked        = start.day >= _MONTH_CUTOFF_DAY; // 24 o más
-        const nextMonthStart = start.plus({ months: 1 }).startOf('month');
-        const diasMax        = Math.max(0, Math.floor(endOfMonth.diff(start, 'days').days) + 1);
+      const minStart = _firstAllowedStart(now);
+      if (start < minStart) start = minStart;
 
-        return { start, endOfMonth, blocked, nextMonthStart, diasMax };
+      // 🔓 Ya no cortamos al fin de mes: miramos hacia adelante N días
+      const end = start.plus({ days: LOOKAHEAD_DAYS - 1 }).endOf('day');
+      const diasMax = Math.max(0, Math.floor(end.diff(start, 'days').days) + 1);
+
+      return {
+        start,                // inicio permitido
+        endOfMonth: end,      // (compat) no se usa como fin de mes ya
+        blocked: false,       // 🔓 nunca bloqueado por “corte del mes”
+        nextMonthStart: null, // (compat) ya no aplica
+        diasMax               // típicamente = LOOKAHEAD_DAYS
       };
+    };
+
   // ─────────────────────────────────────────────────────────
 
   // Desbloqueo de prioridad vencida
@@ -3390,21 +3399,22 @@ if (
         if (pol.blocked) {
           reply = `No agendamos esta semana. La agenda del mes está detenida desde el día ${_MONTH_CUTOFF_DAY}. Vuelve a escribir a partir del ${pol.nextMonthStart.setLocale('es').toFormat("d 'de' LLLL")}.`;
         } else {
-          const desde = pol.start.toISODate();
-          const tipo  = session.tipoActual || 'Control presencial';
-          const dias  = pol.diasMax;
+          const desde = _firstAllowedStart(now).toISODate();
+const tipo  = session.tipoActual || 'Control presencial';
+const dias  = LOOKAHEAD_DAYS; // 🔓 cruza meses
 
-          const diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias });
-          if (!diasDisp.length) {
-            reply = `No tengo cupos en ${pol.start.setLocale('es').toFormat('LLLL')}. ¿Deseas intentar con otro tipo de cita (p. ej., **Control virtual** el viernes tarde)?`;
-          } else {
-            const lineas = diasDisp.map(d => {
-              const fecha = fmtFechaHumana(d.fecha);
-              const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
-              return `- ${fecha}: ${horas}`;
-            }).join('\n');
-            reply = `Disponibilidad de citas (${pol.start.setLocale('es').toFormat('LLLL')}):\n${lineas}\n\n¿Cuál eliges?`;
-          }
+const diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias });
+if (!diasDisp.length) {
+  reply = `No tengo cupos en los próximos ${dias} días. ¿Probamos otro rango?`;
+} else {
+  const lineas = diasDisp.map(d => {
+    const fecha = fmtFechaHumana(d.fecha);
+    const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
+    return `- ${fecha}: ${horas}`;
+  }).join('\n');
+  reply = `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
+}
+
         }
       } catch (e) {
         console.error('❌ Fallback disponibilidad error:', e);

@@ -66,13 +66,17 @@ const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID;
 const MIN_BOOKING_DATE_ISO = '2025-11-12'; // desde el 12 de noviembre en adelante
 // NUEVO — Política mensual de agenda
 const MONTH_CUTOFF_DAY = 24; // desde este día se cierra la agenda del mes actual
-const DEFAULT_RANGE_DAYS = 18;
+
 const PRIORITY_SEND_TO_ALL_STAFF = true;   
 // Permite buscar X días hacia adelante (cruza meses)
 const LOOKAHEAD_DAYS = parseInt(process.env.LOOKAHEAD_DAYS || '60', 10);
-const MAX_LOOKAHEAD_DAYS = parseInt(process.env.MAX_LOOKAHEAD_DAYS || '120', 10); // tope duro
 
 const PRIORITY_LOCK_MINUTES = parseInt(process.env.PRIORITY_LOCK_MINUTES || '60', 10);
+
+
+// ----- Disponibilidad: span por defecto y máximo -----
+const DEFAULT_LOOKAHEAD_DAYS = Number(process.env.LOOKAHEAD_DAYS || 60);   // p.ej. 60
+const MAX_LOOKAHEAD_DAYS     = Number(process.env.MAX_LOOKAHEAD_DAYS || 180); // p.ej. 180
 
 // ====== PRIORITY CONFIG (Isabel 3 : Deivis 1) ======
 const STAFF_ISABEL_PHONE = process.env.STAFF_ISABEL_PHONE || '+57 3007666588'; // ← PÓN LA REAL
@@ -858,49 +862,74 @@ function renderReminderTemplate(tpl, ctx = {}) {
 
 
 // ====== Disponibilidad (rango) ======
-async function disponibilidadPorDias({ tipo, desdeISO, dias = 30, maxSlotsPorDia = 100 }) {
-  console.time(`disponibilidad:${desdeISO}:${dias}:${tipo}`);
-  const start = DateTime.fromISO(desdeISO, { zone: ZONE });
+async function disponibilidadPorDias({ tipo, desdeISO, dias, maxSlotsPorDia = 100 }) {
+  // 1) Normaliza span de días (sin clamps a 18)
+  let span = Number.isFinite(Number(dias)) ? Number(dias) : DEFAULT_LOOKAHEAD_DAYS;
+  span = Math.max(1, Math.min(span, MAX_LOOKAHEAD_DAYS));
 
-  const diasLista = [];
-  for (let i = 0; i < dias; i++) diasLista.push(start.plus({ days: i }));
+  // 2) Normaliza fecha de inicio (nunca pasado, zona correcta)
+  const today = DateTime.now().setZone(ZONE).startOf('day');
+  let start = DateTime.fromISO(desdeISO || '', { zone: ZONE }).startOf('day');
+  if (!start.isValid) start = today;
+  if (start < today)  start = today;
 
+  const startISO = start.toISODate();
+  console.time(`disponibilidad:${startISO}:${span}:${tipo}`);
+
+  // 3) Lista de días a revisar
+  const diasLista = Array.from({ length: span }, (_, i) => start.plus({ days: i }));
+
+  // 4) Concurrencia moderada (evita saturar Google Calendar)
   const CONCURRENCY = 3;
   const out = [];
   let idx = 0;
+  let consulted = 0;
 
   async function worker() {
-    while (idx < diasLista.length) {
-      const d = diasLista[idx++];
+    while (true) {
+      const myIndex = idx++;
+      if (myIndex >= diasLista.length) break;
+
+      const d = diasLista[myIndex];
+      const dISO = d.toISODate();
 
       try {
-        const dISO = d.toISODate();
-        const { dur, ventanas, slots } = generarSlots(dISO, tipo, 2000);
-        if (!ventanas.length) continue;
+        // Genera todas las ventanas/slots válidos del día y tipo
+        const { dur, ventanas, slots } = generarSlots(dISO, tipo, maxSlotsPorDia);
+        if (!ventanas.length) continue;  // día sin ventanas → saltar
+        consulted++;
 
+        // Consulta busy solo si hay ventanas
         console.time(`fb:${dISO}`);
-        const busy = await consultarBusy(ventanas);   // consulta día completo
+        const busy = await consultarBusy(ventanas);
         console.timeEnd(`fb:${dISO}`);
 
-        const libres = filtrarSlotsLibres(slots, busy);  // ← sin slice
+        // Filtra slots libres (sin slice; entregamos todos)
+        const libres = filtrarSlotsLibres(slots, busy);
         if (libres.length) {
           out.push({
             fecha: dISO,
             duracion_min: dur,
             total: libres.length,
-            ejemplos: libres.slice(0, 8).map(s => DateTime.fromISO(s.inicio, { zone: ZONE }).toFormat('HH:mm')), // solo preview
+            ejemplos: libres.slice(0, 8).map(s =>
+              DateTime.fromISO(s.inicio, { zone: ZONE }).toFormat('HH:mm')
+            ),
             slots: libres
           });
         }
       } catch (e) {
-        console.error('⚠️ Error consultando día:', e);
+        console.error('⚠️ Error consultando día', dISO, e?.response?.data || e);
       }
     }
   }
 
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+  // 5) Orden cronológico y métricas
   out.sort((a, b) => a.fecha.localeCompare(b.fecha));
-  console.timeEnd(`disponibilidad:${desdeISO}:${dias}:${tipo}`);
+  console.timeEnd(`disponibilidad:${startISO}:${span}:${tipo}`);
+  console.log(`[DISP] tipo="${tipo}" desde=${startISO} span=${span}d → dias_consultados=${consulted} conCupos=${out.length}`);
+
   return out;
 }
 
@@ -1559,20 +1588,39 @@ async function maybeHandleAssistantAction(text, session) {
   for (const payload of payloads) {
     const action = norm(payload.action || '');
 
-if (action === 'consultar_disponibilidad') {
-  // REEMPLAZA por este encabezado robusto
+if (action === 'consultar_disponibilidad_rango') {
   const userWants = guessTipo(session.lastUserText || '');
   let tipo = (payload.data?.tipo) || userWants || session.tipoActual || 'Control presencial';
-  session.tipoActual = tipo; // persistimos
+  session.tipoActual = tipo;
 
-  let { fecha } = payload.data || {};
-  if (fecha) fecha = coerceFutureISODate(fecha);
+  let { desde, dias } = payload.data || {};
+  const nowLocal   = DateTime.now().setZone(ZONE);
+  const desdeFixed = desde ? coerceFutureISODateOrToday(desde) : nowLocal.toISODate();
 
-  const { dur, ventanas, slots } = generarSlots(fecha, tipo, 60);
-  if (!ventanas.length) { results.push({ ok: true, fecha, tipo, duracion_min: dur, slots: [], note: 'Día sin consulta según reglas' }); continue; }
-  const busy = await consultarBusy(ventanas);
-  const libres = filtrarSlotsLibres(slots, busy);
-  results.push({ ok: true, fecha, tipo, duracion_min: dur, slots: libres });
+  // span solicitado → respétalo dentro de límites sanos
+  let span = Number.isFinite(Number(dias)) ? Number(dias) : DEFAULT_LOOKAHEAD_DAYS;
+  span = Math.max(1, Math.min(span, MAX_LOOKAHEAD_DAYS));
+
+  console.log(`[DISP/ACTION] tipo="${tipo}" desde=${desdeFixed} requested=${dias ?? '(default)'} → usando=${span}`);
+
+  let lista = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: span });
+  if (!lista.length && span < MAX_LOOKAHEAD_DAYS) {
+    // backoff progresivo para no quedar en "no hay"
+    const next = Math.min(MAX_LOOKAHEAD_DAYS, span + DEFAULT_LOOKAHEAD_DAYS);
+    console.log(`[DISP/ACTION] sin cupos con ${span}d → reintento con ${next}d`);
+    span = next;
+    lista = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: span });
+  }
+
+  results.push({
+    ok: true,
+    tipo,
+    desde: desdeFixed,
+    dias: span,                 // compat
+    dias_consultados: span,     // campo nuevo y claro
+    dias_disponibles: lista
+  });
+  session.lastSystemNote = `Consulté disponibilidad ${span}d desde ${desdeFixed} para ${tipo}.`;
   continue;
 }
 
@@ -3240,11 +3288,8 @@ if (cancelIntent) {
   };
 
 } else if (daysResp) {
+  const span = Number(daysResp.dias_consultados || daysResp.dias || DEFAULT_LOOKAHEAD_DAYS);
   if (!daysResp.dias_disponibles.length) {
-    // ANTES:
-    // reply = `No tengo cupos en los próximos ${daysResp.dias} días. ¿Probamos otro rango?`;
-
-    const span = Number(daysResp.dias_consultados || daysResp.dias || process.env.LOOKAHEAD_DAYS || 60);
     reply = `No tengo cupos en los próximos ${span} días. ¿Probamos otro rango?`;
   } else {
     const lineas = daysResp.dias_disponibles.map(d => {
@@ -3255,7 +3300,6 @@ if (cancelIntent) {
     reply = `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
   }
 
-  // Guardar oferta
   session.lastOffered = {
     tipo: session.tipoActual || 'Control presencial',
     days: (daysResp.dias_disponibles || []).map(d => ({
@@ -3265,7 +3309,6 @@ if (cancelIntent) {
     singleDay: (daysResp.dias_disponibles || []).length === 1
   };
 }
-
 
 
    reply = (reply || '').trim();
@@ -3422,26 +3465,24 @@ if (
 
 
        // Fallback: si pidió disponibilidad en texto libre
+// Fallback: si pidió disponibilidad en texto libre (cuando el LLM no emitió acción)
 const u = userMsg.toLowerCase();
 const pideDispon = /disponibilidad|horarios|agenda|qué días|que dias|que horarios|que horario/.test(u);
 if (pideDispon) {
   try {
-    const LOOKAHEAD_DAYS     = Number(process.env.LOOKAHEAD_DAYS || 60);
-    const MAX_LOOKAHEAD_DAYS = Number(process.env.MAX_LOOKAHEAD_DAYS || 180);
-
     const desde = _firstAllowedStart(now).toISODate();
     const tipo  = session.tipoActual || 'Control presencial';
 
-    let span = LOOKAHEAD_DAYS;
+    let span = DEFAULT_LOOKAHEAD_DAYS;
     let diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias: span });
-    console.log(`[DISP/FALLBACK] tipo="${tipo}" desde=${desde} → ${span}d → daysListed=${diasDisp.length}`);
+    console.log(`[DISP/FALLBACK] tipo="${tipo}" desde=${desde} → ${span}d → days=${diasDisp.length}`);
 
     while (!diasDisp.length && span < MAX_LOOKAHEAD_DAYS) {
-      const next = Math.min(MAX_LOOKAHEAD_DAYS, span + LOOKAHEAD_DAYS);
+      const next = Math.min(MAX_LOOKAHEAD_DAYS, span + DEFAULT_LOOKAHEAD_DAYS);
       console.log(`[DISP/FALLBACK] sin cupos con ${span}d → reintento con ${next}d`);
       span = next;
       diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias: span });
-      console.log(`[DISP/FALLBACK] reintento daysListed=${diasDisp.length}`);
+      console.log(`[DISP/FALLBACK] reintento days=${diasDisp.length}`);
     }
 
     if (!diasDisp.length) {
@@ -3459,6 +3500,7 @@ if (pideDispon) {
     reply = '⚠️ No pude consultar la disponibilidad ahora. Intenta de nuevo en unos minutos.';
   }
 }
+
 
 
     reply = stripActionBlocks(reply);

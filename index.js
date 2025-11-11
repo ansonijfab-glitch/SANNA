@@ -1578,32 +1578,26 @@ if (action === 'consultar_disponibilidad') {
 
     // DISPONIBILIDAD (rango)
 if (action === 'consultar_disponibilidad_rango') {
-  // ── Parámetros de búsqueda (con defaults configurables por ENV) ─────────────────
-  const LOOKAHEAD_DAYS     = Number(process.env.LOOKAHEAD_DAYS || 60);   // mínimo a consultar
-  const MAX_LOOKAHEAD_DAYS = Number(process.env.MAX_LOOKAHEAD_DAYS || 180); // tope duro
+  const LOOKAHEAD_DAYS     = Number(process.env.LOOKAHEAD_DAYS || 60);
+  const MAX_LOOKAHEAD_DAYS = Number(process.env.MAX_LOOKAHEAD_DAYS || 180);
 
-  // Tipo (prioriza lo pedido explícito en el último mensaje)
   const userWants = guessTipo(session.lastUserText || '');
   let tipo = (payload.data?.tipo) || userWants || session.tipoActual || 'Control presencial';
-  session.tipoActual = tipo; // persistimos
+  session.tipoActual = tipo;
 
-  // Desde y días solicitados
   let { desde, dias } = payload.data || {};
   const nowLocal   = DateTime.now().setZone(ZONE);
   const desdeFixed = desde ? coerceFutureISODateOrToday(desde) : nowLocal.toISODate();
 
-  // Normaliza días: al menos LOOKAHEAD_DAYS y nunca más que MAX_LOOKAHEAD_DAYS
   const requested = Number.isFinite(Number(dias)) ? Number(dias) : LOOKAHEAD_DAYS;
   let diasUsados  = Math.max(requested, LOOKAHEAD_DAYS);
   diasUsados      = Math.min(diasUsados, MAX_LOOKAHEAD_DAYS);
 
   console.log(`[DISP] solicitud tipo="${tipo}" desde=${desdeFixed} requested=${requested} → usando=${diasUsados}`);
 
-  // Primera consulta
   let lista = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: diasUsados });
   console.log(`[DISP] resultado inicial: daysListed=${lista.length} (usando ${diasUsados}d)`);
 
-  // Auto-extiende si no hay cupos, sin límite de mes
   while (!lista.length && diasUsados < MAX_LOOKAHEAD_DAYS) {
     const next = Math.min(MAX_LOOKAHEAD_DAYS, diasUsados + LOOKAHEAD_DAYS);
     console.log(`[DISP] sin cupos con ${diasUsados}d → reintento con ${next}d`);
@@ -1612,11 +1606,19 @@ if (action === 'consultar_disponibilidad_rango') {
     console.log(`[DISP] reintento: daysListed=${lista.length} (usando ${diasUsados}d)`);
   }
 
-  // Respuesta unificada
-  results.push({ ok: true, tipo, desde: desdeFixed, dias: diasUsados, dias_disponibles: lista });
+  // ⬅️ IMPORTANTE: enviar el valor REAL consultado
+  results.push({
+    ok: true,
+    tipo,
+    desde: desdeFixed,
+    dias: diasUsados,              // compat
+    dias_consultados: diasUsados,  // nuevo campo
+    dias_disponibles: lista
+  });
   session.lastSystemNote = `Consulté disponibilidad ${diasUsados}d desde ${desdeFixed} para ${tipo}.`;
   continue;
 }
+
 
 // CREAR CITA
 if (action === 'crear_cita') {
@@ -3239,7 +3241,11 @@ if (cancelIntent) {
 
 } else if (daysResp) {
   if (!daysResp.dias_disponibles.length) {
-    reply = `No tengo cupos en los próximos ${daysResp.dias} días. ¿Probamos otro rango?`;
+    // ANTES:
+    // reply = `No tengo cupos en los próximos ${daysResp.dias} días. ¿Probamos otro rango?`;
+
+    const span = Number(daysResp.dias_consultados || daysResp.dias || process.env.LOOKAHEAD_DAYS || 60);
+    reply = `No tengo cupos en los próximos ${span} días. ¿Probamos otro rango?`;
   } else {
     const lineas = daysResp.dias_disponibles.map(d => {
       const fecha = fmtFechaHumana(d.fecha);
@@ -3248,15 +3254,18 @@ if (cancelIntent) {
     }).join('\n');
     reply = `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
   }
-  // ⬇️ Guardar oferta
+
+  // Guardar oferta
   session.lastOffered = {
     tipo: session.tipoActual || 'Control presencial',
     days: (daysResp.dias_disponibles || []).map(d => ({
-      fechaISO: d.fecha, slots: (d.slots||[]).map(s => ({ inicio: s.inicio, fin: s.fin }))
+      fechaISO: d.fecha,
+      slots: (d.slots||[]).map(s => ({ inicio: s.inicio, fin: s.fin }))
     })),
     singleDay: (daysResp.dias_disponibles || []).length === 1
   };
 }
+
 
 
    reply = (reply || '').trim();
@@ -3412,39 +3421,45 @@ if (
 
 
 
-    // Fallback: si pidió disponibilidad en texto libre
-    const u = userMsg.toLowerCase();
-    const pideDispon = /disponibilidad|horarios|agenda|qué días|que dias|que horarios|que horario/.test(u);
-    if (pideDispon) {
-      try {
-        const pol = _monthPolicyFrom(_firstAllowedStart(now).toISODate());
-        if (pol.blocked) {
-          reply = `No agendamos esta semana. La agenda del mes está detenida desde el día ${_MONTH_CUTOFF_DAY}. Vuelve a escribir a partir del ${pol.nextMonthStart.setLocale('es').toFormat("d 'de' LLLL")}.`;
-        } else {
-          // dentro de tu bloque "pideDispon"
-const desde = _firstAllowedStart(now).toISODate();
-const tipo  = session.tipoActual || 'Control presencial';
-const dias  = LOOKAHEAD_DAYS;
+       // Fallback: si pidió disponibilidad en texto libre
+const u = userMsg.toLowerCase();
+const pideDispon = /disponibilidad|horarios|agenda|qué días|que dias|que horarios|que horario/.test(u);
+if (pideDispon) {
+  try {
+    const LOOKAHEAD_DAYS     = Number(process.env.LOOKAHEAD_DAYS || 60);
+    const MAX_LOOKAHEAD_DAYS = Number(process.env.MAX_LOOKAHEAD_DAYS || 180);
 
-const diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias });
-if (!diasDisp.length) {
-  reply = `No tengo cupos en los próximos ${dias} días. ¿Probamos otro rango?`;
-} else {
-  const lineas = diasDisp.map(d => {
-    const fecha = fmtFechaHumana(d.fecha);
-    const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
-    return `- ${fecha}: ${horas}`;
-  }).join('\n');
-  reply = `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
+    const desde = _firstAllowedStart(now).toISODate();
+    const tipo  = session.tipoActual || 'Control presencial';
+
+    let span = LOOKAHEAD_DAYS;
+    let diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias: span });
+    console.log(`[DISP/FALLBACK] tipo="${tipo}" desde=${desde} → ${span}d → daysListed=${diasDisp.length}`);
+
+    while (!diasDisp.length && span < MAX_LOOKAHEAD_DAYS) {
+      const next = Math.min(MAX_LOOKAHEAD_DAYS, span + LOOKAHEAD_DAYS);
+      console.log(`[DISP/FALLBACK] sin cupos con ${span}d → reintento con ${next}d`);
+      span = next;
+      diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias: span });
+      console.log(`[DISP/FALLBACK] reintento daysListed=${diasDisp.length}`);
+    }
+
+    if (!diasDisp.length) {
+      reply = `No tengo cupos en los próximos ${span} días. ¿Probamos otro rango?`;
+    } else {
+      const lineas = diasDisp.map(d => {
+        const fecha = fmtFechaHumana(d.fecha);
+        const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
+        return `- ${fecha}: ${horas}`;
+      }).join('\n');
+      reply = `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
+    }
+  } catch (e) {
+    console.error('❌ Fallback disponibilidad error:', e);
+    reply = '⚠️ No pude consultar la disponibilidad ahora. Intenta de nuevo en unos minutos.';
+  }
 }
 
-
-        }
-      } catch (e) {
-        console.error('❌ Fallback disponibilidad error:', e);
-        reply = '⚠️ No pude consultar la disponibilidad ahora. Intenta de nuevo en unos minutos.';
-      }
-    }
 
     reply = stripActionBlocks(reply);
     if (!reply) reply = 'Listo ✅';

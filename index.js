@@ -70,6 +70,7 @@ const DEFAULT_RANGE_DAYS = 18;
 const PRIORITY_SEND_TO_ALL_STAFF = true;   
 // Permite buscar X días hacia adelante (cruza meses)
 const LOOKAHEAD_DAYS = parseInt(process.env.LOOKAHEAD_DAYS || '60', 10);
+const MAX_LOOKAHEAD_DAYS = parseInt(process.env.MAX_LOOKAHEAD_DAYS || '120', 10); // tope duro
 
 const PRIORITY_LOCK_MINUTES = parseInt(process.env.PRIORITY_LOCK_MINUTES || '60', 10);
 
@@ -1577,22 +1578,43 @@ if (action === 'consultar_disponibilidad') {
 
     // DISPONIBILIDAD (rango)
 if (action === 'consultar_disponibilidad_rango') {
-  // REEMPLAZA por este encabezado robusto
+  // ── Parámetros de búsqueda (con defaults configurables por ENV) ─────────────────
+  const LOOKAHEAD_DAYS     = Number(process.env.LOOKAHEAD_DAYS || 60);   // mínimo a consultar
+  const MAX_LOOKAHEAD_DAYS = Number(process.env.MAX_LOOKAHEAD_DAYS || 180); // tope duro
+
+  // Tipo (prioriza lo pedido explícito en el último mensaje)
   const userWants = guessTipo(session.lastUserText || '');
   let tipo = (payload.data?.tipo) || userWants || session.tipoActual || 'Control presencial';
   session.tipoActual = tipo; // persistimos
 
-  let { desde, dias = 60 } = payload.data || {};
-  const nowLocal = DateTime.now().setZone(ZONE);
+  // Desde y días solicitados
+  let { desde, dias } = payload.data || {};
+  const nowLocal   = DateTime.now().setZone(ZONE);
   const desdeFixed = desde ? coerceFutureISODateOrToday(desde) : nowLocal.toISODate();
 
-  // (Si aplicas tu política de mes/corte del 24, deja aquí tus límites)
-  dias = Math.max(18, Math.min(dias, 60));
+  // Normaliza días: al menos LOOKAHEAD_DAYS y nunca más que MAX_LOOKAHEAD_DAYS
+  const requested = Number.isFinite(Number(dias)) ? Number(dias) : LOOKAHEAD_DAYS;
+  let diasUsados  = Math.max(requested, LOOKAHEAD_DAYS);
+  diasUsados      = Math.min(diasUsados, MAX_LOOKAHEAD_DAYS);
 
-  let lista = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias });
+  console.log(`[DISP] solicitud tipo="${tipo}" desde=${desdeFixed} requested=${requested} → usando=${diasUsados}`);
 
-  // (Si ya quitaste el “ampliar a 30 días”, conserva tu versión)
-  results.push({ ok: true, tipo, desde: desdeFixed, dias, dias_disponibles: lista });
+  // Primera consulta
+  let lista = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: diasUsados });
+  console.log(`[DISP] resultado inicial: daysListed=${lista.length} (usando ${diasUsados}d)`);
+
+  // Auto-extiende si no hay cupos, sin límite de mes
+  while (!lista.length && diasUsados < MAX_LOOKAHEAD_DAYS) {
+    const next = Math.min(MAX_LOOKAHEAD_DAYS, diasUsados + LOOKAHEAD_DAYS);
+    console.log(`[DISP] sin cupos con ${diasUsados}d → reintento con ${next}d`);
+    diasUsados = next;
+    lista = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: diasUsados });
+    console.log(`[DISP] reintento: daysListed=${lista.length} (usando ${diasUsados}d)`);
+  }
+
+  // Respuesta unificada
+  results.push({ ok: true, tipo, desde: desdeFixed, dias: diasUsados, dias_disponibles: lista });
+  session.lastSystemNote = `Consulté disponibilidad ${diasUsados}d desde ${desdeFixed} para ${tipo}.`;
   continue;
 }
 
@@ -3399,9 +3421,10 @@ if (
         if (pol.blocked) {
           reply = `No agendamos esta semana. La agenda del mes está detenida desde el día ${_MONTH_CUTOFF_DAY}. Vuelve a escribir a partir del ${pol.nextMonthStart.setLocale('es').toFormat("d 'de' LLLL")}.`;
         } else {
-          const desde = _firstAllowedStart(now).toISODate();
+          // dentro de tu bloque "pideDispon"
+const desde = _firstAllowedStart(now).toISODate();
 const tipo  = session.tipoActual || 'Control presencial';
-const dias  = LOOKAHEAD_DAYS; // 🔓 cruza meses
+const dias  = LOOKAHEAD_DAYS;
 
 const diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias });
 if (!diasDisp.length) {
@@ -3414,6 +3437,7 @@ if (!diasDisp.length) {
   }).join('\n');
   reply = `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
 }
+
 
         }
       } catch (e) {

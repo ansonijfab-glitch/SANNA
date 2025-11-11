@@ -62,21 +62,23 @@ app.use(bodyParser.json());
 
 // =================== ENV / CONFIG ===================
 const ZONE = 'America/Bogota';
+// ===== Disponibilidad: span configurable =====
+const LOOKAHEAD_DAYS = Number(process.env.LOOKAHEAD_DAYS || 60);   // por defecto 60
+const MAX_LOOKAHEAD_DAYS = Number(process.env.MAX_LOOKAHEAD_DAYS || 180); // tope 180
+const DEFAULT_LOOKAHEAD_DAYS = Number(process.env.MAX_LOOKAHEAD_DAYS || 60); // tope 180
+
+
 const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID;
 const MIN_BOOKING_DATE_ISO = '2025-11-12'; // desde el 12 de noviembre en adelante
 // NUEVO — Política mensual de agenda
 const MONTH_CUTOFF_DAY = 24; // desde este día se cierra la agenda del mes actual
 
 const PRIORITY_SEND_TO_ALL_STAFF = true;   
-// Permite buscar X días hacia adelante (cruza meses)
-const LOOKAHEAD_DAYS = parseInt(process.env.LOOKAHEAD_DAYS || '60', 10);
+
 
 const PRIORITY_LOCK_MINUTES = parseInt(process.env.PRIORITY_LOCK_MINUTES || '60', 10);
 
 
-// ----- Disponibilidad: span por defecto y máximo -----
-const DEFAULT_LOOKAHEAD_DAYS = Number(process.env.LOOKAHEAD_DAYS || 60);   // p.ej. 60
-const MAX_LOOKAHEAD_DAYS     = Number(process.env.MAX_LOOKAHEAD_DAYS || 180); // p.ej. 180
 
 // ====== PRIORITY CONFIG (Isabel 3 : Deivis 1) ======
 const STAFF_ISABEL_PHONE = process.env.STAFF_ISABEL_PHONE || '+57 3007666588'; // ← PÓN LA REAL

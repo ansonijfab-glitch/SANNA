@@ -237,7 +237,7 @@ FLUJO ESTRICTO (cuando NO hay prioridad activa)
 
 7) **Disponibilidad y agendamiento**:
    - Si el paciente pide **horarios de un día concreto** → envía **consultar_disponibilidad**.
-   - Si pide “qué días tienes libres” o no da fecha → envía **consultar_disponibilidad_rango** desde **hoy** por **18 días**.
+   - Si pide “qué días tienes libres” o no da fecha → envía **consultar_disponibilidad_rango** desde **hoy** por **60 días**.
    - Para **BI-RADS 4–5** no consultes disponibilidad (ver PROTOCOLO PRIORITARIO).
    - Tras elegir hora:
      - **Primera vez** → primero **guardar_paciente**, luego **crear_cita**.
@@ -334,7 +334,7 @@ ACCIONES (JSON ONLY) — **formatos exactos**
 3) Consultar días con cupo (rango)
 {
   "action": "consultar_disponibilidad_rango",
-  "data": { "tipo": "Control presencial", "desde": "2025-10-01", "dias": 18 }
+  "data": { "tipo": "Control presencial", "desde": "2025-10-01", "dias": 60 }
 }
 
 4) Crear cita 
@@ -1288,7 +1288,7 @@ app.get('/api/panel/metrics', async (req, res) => {
 
     // eventos próximos 14 días
     const timeMin = now.toUTC().toISO();
-    const timeMax = now.plus({ days: 18 }).toUTC().toISO();
+    const timeMax = now.plus({ days: 60 }).toUTC().toISO();
     const resp = await calendar.events.list({
       calendarId: CALENDAR_ID,
       timeMin, timeMax,
@@ -1582,7 +1582,7 @@ if (action === 'consultar_disponibilidad_rango') {
   let tipo = (payload.data?.tipo) || userWants || session.tipoActual || 'Control presencial';
   session.tipoActual = tipo; // persistimos
 
-  let { desde, dias = 18 } = payload.data || {};
+  let { desde, dias = 60 } = payload.data || {};
   const nowLocal = DateTime.now().setZone(ZONE);
   const desdeFixed = desde ? coerceFutureISODateOrToday(desde) : nowLocal.toISODate();
 
@@ -3456,7 +3456,7 @@ app.post('/availability', async (req, res) => {
 app.post('/availability-range', async (req, res) => {
   try {
     const { tipo = 'Control presencial' } = req.body;
-    let { desde, dias = 18 } = req.body;
+    let { desde, dias = 60 } = req.body;
     if (!desde) return res.status(400).json({ ok: false, error: 'falta_desde' });
 
     const desdeFixed = coerceFutureISODateOrToday(desde);

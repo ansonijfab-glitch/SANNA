@@ -62,27 +62,61 @@ app.use(bodyParser.json());
 
 // =================== ENV / CONFIG ===================
 const ZONE = 'America/Bogota';
-// ===== Disponibilidad: span configurable =====
-const LOOKAHEAD_DAYS = Number(process.env.LOOKAHEAD_DAYS || 60);   // por defecto 60
-const MAX_LOOKAHEAD_DAYS = Number(process.env.MAX_LOOKAHEAD_DAYS || 180); // tope 180
-const DEFAULT_LOOKAHEAD_DAYS = Number(process.env.MAX_LOOKAHEAD_DAYS || 60); // tope 180
-
-
 const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID;
 const MIN_BOOKING_DATE_ISO = '2025-11-12'; // desde el 12 de noviembre en adelante
 // NUEVO — Política mensual de agenda
-const MONTH_CUTOFF_DAY = 24; // desde este día se cierra la agenda del mes actual
 
 const PRIORITY_SEND_TO_ALL_STAFF = true;   
+ // OJO: 99 “apaga” el bloqueo; también puedes eliminar su uso (ver paso 2)
+ const MONTH_CUTOFF_DAY = 20;
+ // Amplía el rango por defecto (por ejemplo, 60-90 días)
+
+
+const DEFAULT_RANGE_DAYS = Number(process.env.DEFAULT_RANGE_DAYS || 21);
+const MAX_DAYS_TO_SHOW   = Number(process.env.MAX_DAYS_TO_SHOW   || 5);
+const MAX_SLOTS_PER_DAY  = Number(process.env.MAX_SLOTS_PER_DAY  || 4);
 
 
 const PRIORITY_LOCK_MINUTES = parseInt(process.env.PRIORITY_LOCK_MINUTES || '60', 10);
 
-
-
 // ====== PRIORITY CONFIG (Isabel 3 : Deivis 1) ======
-const STAFF_ISABEL_PHONE = process.env.STAFF_ISABEL_PHONE || '+57 3007666588'; // ← PÓN LA REAL
+const STAFF_ISABEL_PHONE = process.env.STAFF_ISABEL_PHONE || '+57 3108611759'; // ← PÓN LA REAL
 const STAFF_DEIVIS_PHONE = process.env.STAFF_DEIVIS_PHONE || '+57 3108611759'; // ya la tienes
+
+
+// === Objetivo y tope: 30 días hábiles, dentro de 30 días calendario ===
+const HABILES_TARGET          = Number(process.env.HABILES_TARGET || 30);
+const CALENDAR_HORIZON_DAYS   = Number(process.env.CALENDAR_HORIZON_DAYS || 30);
+const AVAIL_COOLDOWN_SEC      = 0; // evita silencios
+
+function firstAllowedStartSafe(now = DateTime.now().setZone(ZONE)) {
+  const base = now.startOf('day');
+  if (typeof MIN_BOOKING_DATE_ISO === 'string' && MIN_BOOKING_DATE_ISO) {
+    const min = DateTime.fromISO(MIN_BOOKING_DATE_ISO, { zone: ZONE }).startOf('day');
+    return (min.isValid && min > base) ? min : base;
+  }
+  return base;
+}
+
+function logAvailTrace(tag, obj) {
+  try { console.log(`[AVAIL] ${tag} ${JSON.stringify(obj)}`); } catch {}
+}
+
+function makeAvailKey({ tipo, desdeISO, habiles }) {
+  const t = (typeof norm === 'function') ? norm(tipo || '') : String(tipo || '').toLowerCase().trim();
+  return `${t}|${desdeISO || ''}|H${Number(habiles || 0)}`;
+}
+
+function shouldBlockAvail(session, key, now = DateTime.now().setZone(ZONE)) {
+  const cd = Number(AVAIL_COOLDOWN_SEC);
+  if (cd <= 0) { session.lastShownAvailKey = key; session._lastAvailAtISO = now.toISO(); return false; }
+  const lastKey = session.lastShownAvailKey;
+  const lastAt  = session._lastAvailAtISO ? DateTime.fromISO(session._lastAvailAtISO, { zone: ZONE }) : null;
+  if (lastKey === key && lastAt?.isValid && now.diff(lastAt, 'seconds').seconds < cd) return true;
+  session.lastShownAvailKey = key; session._lastAvailAtISO = now.toISO(); return false;
+}
+
+
 
 function phoneToJid(phone) {
   const digits = String(phone || '').replace(/\D/g, '');
@@ -225,7 +259,7 @@ FLUJO ESTRICTO (cuando NO hay prioridad activa)
    - Solicita el resultado más reciente de **mamografía/ecografía** y la **categoría BI-RADS**.
    - Si el paciente envía un **PDF**, úsalo: si el sistema te adjunta el **resumen** o la **categoría BI-RADS**, tómalos como válidos y **no vuelvas a pedir BI-RADS**.
    - Si **BI-RADS 4 o 5** → dar manera hamable y sin emojis el numero de deivis
-   - Si **BI-RADS 3** → preferir cita en **≤ 7 días hábiles**.
+   - Si **BI-RADS 3**.
    - Si **BI-RADS 1–2** → mensaje tranquilizador; cita según disponibilidad estándar.
    - Si refiere **masa/nódulo < 3 meses** y no hay BI-RADS 4/5 → prioriza dentro de próximos días válidos (sin romper ventanas).
 
@@ -244,7 +278,7 @@ FLUJO ESTRICTO (cuando NO hay prioridad activa)
 
 7) **Disponibilidad y agendamiento**:
    - Si el paciente pide **horarios de un día concreto** → envía **consultar_disponibilidad**.
-   - Si pide “qué días tienes libres” o no da fecha → envía **consultar_disponibilidad_rango** desde **hoy** por **60 días**.
+   - Si pide “qué días tienes libres” o no da fecha → envía **consultar_disponibilidad_rango** desde **hoy** por **20 días**.
    - Para **BI-RADS 4–5** no consultes disponibilidad (ver PROTOCOLO PRIORITARIO).
    - Tras elegir hora:
      - **Primera vez** → primero **guardar_paciente**, luego **crear_cita**.
@@ -341,7 +375,7 @@ ACCIONES (JSON ONLY) — **formatos exactos**
 3) Consultar días con cupo (rango)
 {
   "action": "consultar_disponibilidad_rango",
-  "data": { "tipo": "Control presencial", "desde": "2025-10-01", "dias": 60 }
+  "data": { "tipo": "Control presencial", "desde": "2025-10-01"}
 }
 
 4) Crear cita 
@@ -377,21 +411,30 @@ function getSession(userId) {
     s && now.diff(DateTime.fromISO(s.updatedAtISO || now.toISO())).as('minutes') > SESSION_TTL_MIN;
 
   if (!s || expired) {
-    // REEMPLAZA dentro de getSession (objeto s = { ... })
-s = {
-  history: [{ role: 'system', content: systemPrompt }],
-  lastSystemNote: null,
-  updatedAtISO: now.toISO(),
-  priority: null,
-  cancelGuard: { windowStartISO: now.toISO(), attempts: 0 },
-  birads: null,
-  tipoActual: null, // NUEVO — persistir tipo (Primera vez / Control / Virtual / Biopsia)
-};
-
+    s = {
+      history: [{ role: 'system', content: systemPrompt }],
+      lastSystemNote: null,
+      updatedAtISO: now.toISO(),
+      priority: null,
+      cancelGuard: { windowStartISO: now.toISO(), attempts: 0 },
+      birads: null,
+      tipoActual: null,
+      // NUEVO:
+      jid: userId,
+      rangeLockHabiles: HABILES_TARGET, // objetivo fijo p/ todos los JID
+    };
     sessions.set(userId, s);
   }
+
+  // Asegura el lock también para sesiones viejas ya existentes
+  if (!s.rangeLockHabiles || s.rangeLockHabiles !== HABILES_TARGET) {
+    s.rangeLockHabiles = HABILES_TARGET;
+  }
+
   return s;
 }
+
+
 function touchSession(s) { s.updatedAtISO = DateTime.now().setZone(ZONE).toISO(); }
 function capHistory(session, max = 40) {
   if (session.history.length > max) {
@@ -480,6 +523,79 @@ function renderPriorityAlert(tpl, ctx) {
   return String(tpl || '').replace(/\{(birads|paciente|jid|fechaHora|fuente)\}/g, (_, k) => map[k] ?? '');
 }
 
+
+
+async function showAvailabilityNowBusinessStrict(session, now, opts = {}) {
+  const force    = !!opts.force;
+  const nowLocal = (now && typeof now.setZone === 'function') ? now.setZone(ZONE) : DateTime.now().setZone(ZONE);
+  const startRef = firstAllowedStartSafe(nowLocal);           // ← SIEMPRE hoy (o MIN_BOOKING), NO “12-11 → 12-11”
+  const desdeISO = startRef.toISODate();
+  const horizon  = startRef.plus({ days: CALENDAR_HORIZON_DAYS }).toISODate();
+  const tipo     = session.tipoActual || 'Control presencial';
+
+  if (!force) {
+    const key = makeAvailKey({ tipo, desdeISO, habiles: HABILES_TARGET });
+    if (shouldBlockAvail(session, key)) return 'Listo ✅';
+  }
+
+  // Trae SOLO hasta el horizonte calendario de 30 días
+  const diasCalendar = CALENDAR_HORIZON_DAYS;
+  console.log(`disponibilidad:${desdeISO}:${diasCalendar}:${tipo}`);
+
+  const raw = await disponibilidadPorDias({ tipo, desdeISO, dias: diasCalendar });
+
+  // Dedupe por fecha y ordena (MOSTRAR TODAS las horas por día)
+  const byDate = new Map();
+  for (const d of (raw || [])) {
+    if (d.fecha > horizon) continue;                     // ← no pasar del 30 calendario
+    const k = d.fecha;
+    const prev = byDate.get(k);
+    const merged = (prev?.slots || []).concat(d.slots || []);
+    const seen = new Set();
+    const slots = merged
+      .filter(s => { const key = String(s.inicio); if (seen.has(key)) return false; seen.add(key); return true; })
+      .sort((a, b) => String(a.inicio).localeCompare(String(b.inicio)));
+    byDate.set(k, { fecha: k, slots });
+  }
+
+  // Primeros N días HÁBILES (con slots), sin pasar del horizonte
+  const ordered = [...byDate.values()]
+    .filter(d => (d.slots || []).length > 0)
+    .sort((a, b) => a.fecha.localeCompare(b.fecha))
+    .slice(0, HABILES_TARGET);
+
+  // Guarda la oferta para agendar con “solo la hora”
+  session._lastOffered = ordered.map(d => ({ fecha: d.fecha, horas: (d.slots || []).map(s => String(s.inicio)) }));
+
+  logAvailTrace('STRICT', {
+    jid: session.jid, tipo,
+    desdeISO, horizonISO: horizon,
+    habilesTarget: HABILES_TARGET,
+    shownDays: ordered.length,
+    firstShown: ordered[0]?.fecha || null,
+    lastShown:  ordered[ordered.length - 1]?.fecha || null
+  });
+
+  if (!ordered.length) {
+    return `No veo cupos dentro de los próximos ${HABILES_TARGET} días hábiles para **${tipo}** ` +
+           `en el horizonte de ${CALENDAR_HORIZON_DAYS} días calendario. ` +
+           `¿Quieres intentar otro tipo (p. ej., **Control virtual**) o una fecha exacta?`;
+  }
+
+  const lineas = ordered.map(d => {
+    const f = fmtFechaHumana(d.fecha);
+    const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
+    return `- ${f}: ${horas}`;
+  }).join('\n');
+
+  return `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
+}
+
+
+
+
+
+
 // Enviar alerta a Isabel y Deivis, marcando un primario 3:1
 async function notifyPriorityStaffAll(remoteJid, birads, fuente = 'PDF') {
   const now = DateTime.now().setZone(ZONE);
@@ -509,6 +625,31 @@ async function notifyPriorityStaffAll(remoteJid, birads, fuente = 'PDF') {
       console.error(`❌ Error enviando prioridad a ${t.name}:`, e);
     }
   }
+}
+
+// Devuelve los PRIMEROS N días con slots (según tus ventanas) mirando hasta LOOKAHEAD_MAX_DAYS
+async function listAvailabilityBusinessDays({ tipo, desdeISO, habilesTarget = HABILES_TARGET, lookaheadMaxDays = LOOKAHEAD_MAX_DAYS }) {
+  // Trae un rango amplio en calendario (no importa que sea grande)
+  let lista = await disponibilidadPorDias({ tipo, desdeISO, dias: lookaheadMaxDays });
+
+  // Dedupe por fecha y ordena; conserva TODAS las horas por día
+  const byDate = new Map();
+  for (const d of (lista || [])) {
+    const k = d.fecha;
+    const prev = byDate.get(k);
+    const merged = (prev?.slots || []).concat(d.slots || []);
+    const seen = new Set();
+    const slots = merged
+      .filter(s => { const key = String(s.inicio); if (seen.has(key)) return false; seen.add(key); return true; })
+      .sort((a, b) => String(a.inicio).localeCompare(String(b.inicio)));
+    byDate.set(k, { fecha: k, slots });
+  }
+  const ordered = [...byDate.values()]
+    .filter(d => (d.slots || []).length > 0) // solo días con agenda real
+    .sort((a, b) => a.fecha.localeCompare(b.fecha));
+
+  // Toma exactamente los primeros N días HÁBILES (con slots)
+  return ordered.slice(0, Number(habilesTarget));
 }
 
 // Pide número al paciente y marca el chat como "waiting_phone"
@@ -780,24 +921,27 @@ function firstAllowedStart(now = DateTime.now().setZone(ZONE)) {
   return start;
 }
 
-function monthPolicyFrom(desdeISO) {
-  let start = DateTime.fromISO(desdeISO, { zone: ZONE });
-  if (!start.isValid) start = firstAllowedStart();
-  const minStart = firstAllowedStart();
-  if (start < minStart) start = minStart;
-
-  const endOfMonth    = start.endOf('month').startOf('day');
-  const blocked       = start.day >= MONTH_CUTOFF_DAY; // 24 o más
-  const nextMonthStart= start.plus({ months: 1 }).startOf('month');
-  const diasMax       = Math.max(0, Math.floor(endOfMonth.diff(start, 'days').days) + 1);
-
-  return { start, endOfMonth, blocked, nextMonthStart, diasMax };
+ function monthPolicyFrom(desdeISO) {
+   // Sin bloqueo mensual ni límite al fin de mes
+   let start = DateTime.fromISO(desdeISO, { zone: ZONE });
+   if (!start.isValid) start = firstAllowedStart();
+   const minStart = firstAllowedStart();
+   if (start < minStart) start = minStart;
+   const diasMax = 180; // o el número que quieras permitir (2–6 meses, por ejemplo)
+   const nextMonthStart = start.plus({ months: 1 }).startOf('month');
+   return {
+     start,
+     endOfMonth: start.plus({ days: diasMax - 1 }).startOf('day'),
+     blocked: false,
+     nextMonthStart,
+     diasMax
+   };
 }
 
-function clampDiasToMonth(desdeISO, diasSolicitados) {
-  const pol = monthPolicyFrom(desdeISO);
-  return Math.min(diasSolicitados, pol.diasMax);
-}
+function clampDiasToMonth(_desdeISO, diasSolicitados) {
+   // No recortar: respeta lo que pida el usuario/bot
+   return diasSolicitados;
+ }
 
 
 function filtrarSlotsLibres(slots, busy) {
@@ -864,74 +1008,49 @@ function renderReminderTemplate(tpl, ctx = {}) {
 
 
 // ====== Disponibilidad (rango) ======
-async function disponibilidadPorDias({ tipo, desdeISO, dias, maxSlotsPorDia = 100 }) {
-  // 1) Normaliza span de días (sin clamps a 18)
-  let span = Number.isFinite(Number(dias)) ? Number(dias) : DEFAULT_LOOKAHEAD_DAYS;
-  span = Math.max(1, Math.min(span, MAX_LOOKAHEAD_DAYS));
+async function disponibilidadPorDias({ tipo, desdeISO, dias = 30, maxSlotsPorDia = 100 }) {
+  console.time(`disponibilidad:${desdeISO}:${dias}:${tipo}`);
+  const start = DateTime.fromISO(desdeISO, { zone: ZONE });
 
-  // 2) Normaliza fecha de inicio (nunca pasado, zona correcta)
-  const today = DateTime.now().setZone(ZONE).startOf('day');
-  let start = DateTime.fromISO(desdeISO || '', { zone: ZONE }).startOf('day');
-  if (!start.isValid) start = today;
-  if (start < today)  start = today;
+  const diasLista = [];
+  for (let i = 0; i < dias; i++) diasLista.push(start.plus({ days: i }));
 
-  const startISO = start.toISODate();
-  console.time(`disponibilidad:${startISO}:${span}:${tipo}`);
-
-  // 3) Lista de días a revisar
-  const diasLista = Array.from({ length: span }, (_, i) => start.plus({ days: i }));
-
-  // 4) Concurrencia moderada (evita saturar Google Calendar)
   const CONCURRENCY = 3;
   const out = [];
   let idx = 0;
-  let consulted = 0;
 
   async function worker() {
-    while (true) {
-      const myIndex = idx++;
-      if (myIndex >= diasLista.length) break;
-
-      const d = diasLista[myIndex];
-      const dISO = d.toISODate();
+    while (idx < diasLista.length) {
+      const d = diasLista[idx++];
 
       try {
-        // Genera todas las ventanas/slots válidos del día y tipo
-        const { dur, ventanas, slots } = generarSlots(dISO, tipo, maxSlotsPorDia);
-        if (!ventanas.length) continue;  // día sin ventanas → saltar
-        consulted++;
+        const dISO = d.toISODate();
+        const { dur, ventanas, slots } = generarSlots(dISO, tipo, 2000);
+        if (!ventanas.length) continue;
 
-        // Consulta busy solo si hay ventanas
         console.time(`fb:${dISO}`);
-        const busy = await consultarBusy(ventanas);
+        const busy = await consultarBusy(ventanas);   // consulta día completo
         console.timeEnd(`fb:${dISO}`);
 
-        // Filtra slots libres (sin slice; entregamos todos)
-        const libres = filtrarSlotsLibres(slots, busy);
+        const libres = filtrarSlotsLibres(slots, busy);  // ← sin slice
         if (libres.length) {
           out.push({
             fecha: dISO,
             duracion_min: dur,
             total: libres.length,
-            ejemplos: libres.slice(0, 8).map(s =>
-              DateTime.fromISO(s.inicio, { zone: ZONE }).toFormat('HH:mm')
-            ),
+            ejemplos: libres.slice(0, 8).map(s => DateTime.fromISO(s.inicio, { zone: ZONE }).toFormat('HH:mm')), // solo preview
             slots: libres
           });
         }
       } catch (e) {
-        console.error('⚠️ Error consultando día', dISO, e?.response?.data || e);
+        console.error('⚠️ Error consultando día:', e);
       }
     }
   }
 
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-
-  // 5) Orden cronológico y métricas
   out.sort((a, b) => a.fecha.localeCompare(b.fecha));
-  console.timeEnd(`disponibilidad:${startISO}:${span}:${tipo}`);
-  console.log(`[DISP] tipo="${tipo}" desde=${startISO} span=${span}d → dias_consultados=${consulted} conCupos=${out.length}`);
-
+  console.timeEnd(`disponibilidad:${desdeISO}:${dias}:${tipo}`);
   return out;
 }
 
@@ -982,27 +1101,59 @@ function extractHour(text) {
 }
 
 async function showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom) {
-  const pol  = _monthPolicyFrom(_firstAllowedStart(now).toISODate());
-  if (pol.blocked) {
-    return `No agendamos esta semana. La agenda del mes está detenida desde el día ${_MONTH_CUTOFF_DAY}. ` +
-           `Vuelve a escribir a partir del ${pol.nextMonthStart.setLocale('es').toFormat("d 'de' LLLL")}.`;
-  }
+  const pol   = _monthPolicyFrom(_firstAllowedStart(now).toISODate());
   const desde = pol.start.toISODate();
-  const tipo  = session.tipoActual || 'Control presencial';
-  const dias  = pol.diasMax;
+  const tipo  = session.tipoActual || 'Primera vez';
 
-  const diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias });
-  if (!diasDisp.length) {
-    return `No tengo cupos en ${pol.start.setLocale('es').toFormat('LLLL')}. ` +
-           `¿Deseas intentar con otro tipo de cita (p. ej., **Control virtual** el viernes tarde)?`;
+  const dias  = DEFAULT_RANGE_DAYS; // ya no meses completos
+
+  let diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias });
+
+  // Dedup por fecha y hora
+  const byDate = new Map();
+  for (const d of diasDisp) {
+    const k = d.fecha;
+    const prev = byDate.get(k);
+    const merged = (prev?.slots || []).concat(d.slots || []);
+    const seen = new Set();
+    const slots = merged
+      .filter(s => {
+        const key = String(s.inicio);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort((a,b) => String(a.inicio).localeCompare(String(b.inicio)));
+    byDate.set(k, { fecha: k, slots });
   }
-  const lineas = diasDisp.map(d => {
+  diasDisp = [...byDate.values()]
+    .filter(d => (d.slots || []).length > 0)
+    .sort((a,b) => a.fecha.localeCompare(b.fecha));
+
+  if (!diasDisp.length) {
+    const alt = tipo.toLowerCase().includes('virtual') ? 'Control presencial' : 'Control virtual';
+    return `No encontré cupos en los próximos ${dias} días para **${tipo}**. ¿Probamos con **${alt}** o una fecha específica (ej. “3 de enero a las 8:20”)?`;
+  }
+
+  // Solo primeros N días y hasta M horas por día
+  const preview = diasDisp.slice(0, MAX_DAYS_TO_SHOW);
+  const lineas = preview.map(d => {
     const fecha = fmtFechaHumana(d.fecha);
-    const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
-    return `- ${fecha}: ${horas}`;
+    const horas = (d.slots || [])
+      .slice(0, MAX_SLOTS_PER_DAY)
+      .map(s => fmtHoraHumana(s.inicio)).join(', ');
+    const extra = (d.slots || []).length > MAX_SLOTS_PER_DAY ? '…' : '';
+    return `- ${fecha}: ${horas}${extra}`;
   }).join('\n');
-  return `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
+
+  const restantes = Math.max(0, diasDisp.length - preview.length);
+  const cola = restantes
+    ? `\n\n(Puedo mostrar más días si quieres, o dime una fecha/hora exacta).`
+    : '';
+
+  return `Disponibilidad para **${tipo}** (primeros ${preview.length} días con cupos):\n${lineas}${cola}`;
 }
+
 
 
 async function alternativasCercanas({ tipo, desdeISO, dias = 10, limite = 6 }) {
@@ -1320,7 +1471,7 @@ app.get('/api/panel/metrics', async (req, res) => {
 
     // eventos próximos 14 días
     const timeMin = now.toUTC().toISO();
-    const timeMax = now.plus({ days: 60 }).toUTC().toISO();
+    const timeMax = now.plus({ days: 30 }).toUTC().toISO();
     const resp = await calendar.events.list({
       calendarId: CALENDAR_ID,
       timeMin, timeMax,
@@ -1590,85 +1741,66 @@ async function maybeHandleAssistantAction(text, session) {
   for (const payload of payloads) {
     const action = norm(payload.action || '');
 
-if (action === 'consultar_disponibilidad_rango') {
+if (action === 'consultar_disponibilidad') {
+  // REEMPLAZA por este encabezado robusto
   const userWants = guessTipo(session.lastUserText || '');
   let tipo = (payload.data?.tipo) || userWants || session.tipoActual || 'Control presencial';
-  session.tipoActual = tipo;
+  session.tipoActual = tipo; // persistimos
 
-  let { desde, dias } = payload.data || {};
-  const nowLocal   = DateTime.now().setZone(ZONE);
-  const desdeFixed = desde ? coerceFutureISODateOrToday(desde) : nowLocal.toISODate();
+  let { fecha } = payload.data || {};
+  if (fecha) fecha = coerceFutureISODate(fecha);
 
-  // span solicitado → respétalo dentro de límites sanos
-  let span = Number.isFinite(Number(dias)) ? Number(dias) : DEFAULT_LOOKAHEAD_DAYS;
-  span = Math.max(1, Math.min(span, MAX_LOOKAHEAD_DAYS));
-
-  console.log(`[DISP/ACTION] tipo="${tipo}" desde=${desdeFixed} requested=${dias ?? '(default)'} → usando=${span}`);
-
-  let lista = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: span });
-  if (!lista.length && span < MAX_LOOKAHEAD_DAYS) {
-    // backoff progresivo para no quedar en "no hay"
-    const next = Math.min(MAX_LOOKAHEAD_DAYS, span + DEFAULT_LOOKAHEAD_DAYS);
-    console.log(`[DISP/ACTION] sin cupos con ${span}d → reintento con ${next}d`);
-    span = next;
-    lista = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: span });
-  }
-
-  results.push({
-    ok: true,
-    tipo,
-    desde: desdeFixed,
-    dias: span,                 // compat
-    dias_consultados: span,     // campo nuevo y claro
-    dias_disponibles: lista
-  });
-  session.lastSystemNote = `Consulté disponibilidad ${span}d desde ${desdeFixed} para ${tipo}.`;
+  const { dur, ventanas, slots } = generarSlots(fecha, tipo, 60);
+  if (!ventanas.length) { results.push({ ok: true, fecha, tipo, duracion_min: dur, slots: [], note: 'Día sin consulta según reglas' }); continue; }
+  const busy = await consultarBusy(ventanas);
+  const libres = filtrarSlotsLibres(slots, busy);
+  results.push({ ok: true, fecha, tipo, duracion_min: dur, slots: libres });
   continue;
 }
 
     // DISPONIBILIDAD (rango)
 if (action === 'consultar_disponibilidad_rango') {
-  const LOOKAHEAD_DAYS     = Number(process.env.LOOKAHEAD_DAYS || 60);
-  const MAX_LOOKAHEAD_DAYS = Number(process.env.MAX_LOOKAHEAD_DAYS || 180);
-
   const userWants = guessTipo(session.lastUserText || '');
   let tipo = (payload.data?.tipo) || userWants || session.tipoActual || 'Control presencial';
   session.tipoActual = tipo;
 
   let { desde, dias } = payload.data || {};
   const nowLocal   = DateTime.now().setZone(ZONE);
-  const desdeFixed = desde ? coerceFutureISODateOrToday(desde) : nowLocal.toISODate();
+  const startRef   = firstAllowedStartSafe(nowLocal);
+  const desdeFixed = desde ? coerceFutureISODateOrToday(desde) : startRef.toISODate();
 
-  const requested = Number.isFinite(Number(dias)) ? Number(dias) : LOOKAHEAD_DAYS;
-  let diasUsados  = Math.max(requested, LOOKAHEAD_DAYS);
-  diasUsados      = Math.min(diasUsados, MAX_LOOKAHEAD_DAYS);
+  // Tope duro: no mirar más de CALENDAR_HORIZON_DAYS
+  const diasCalendar = Math.min(Number(dias || CALENDAR_HORIZON_DAYS), CALENDAR_HORIZON_DAYS);
 
-  console.log(`[DISP] solicitud tipo="${tipo}" desde=${desdeFixed} requested=${requested} → usando=${diasUsados}`);
+  const raw = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: diasCalendar });
 
-  let lista = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: diasUsados });
-  console.log(`[DISP] resultado inicial: daysListed=${lista.length} (usando ${diasUsados}d)`);
-
-  while (!lista.length && diasUsados < MAX_LOOKAHEAD_DAYS) {
-    const next = Math.min(MAX_LOOKAHEAD_DAYS, diasUsados + LOOKAHEAD_DAYS);
-    console.log(`[DISP] sin cupos con ${diasUsados}d → reintento con ${next}d`);
-    diasUsados = next;
-    lista = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: diasUsados });
-    console.log(`[DISP] reintento: daysListed=${lista.length} (usando ${diasUsados}d)`);
+  // Dedupe por fecha, TODAS las horas, ordenar
+  const byDate = new Map();
+  for (const d of raw || []) {
+    const k = d.fecha;
+    const prev = byDate.get(k);
+    const merged = (prev?.slots || []).concat(d.slots || []);
+    const seen = new Set();
+    const slots = merged
+      .filter(s => { const key = String(s.inicio); if (seen.has(key)) return false; seen.add(key); return true; })
+      .sort((a, b) => String(a.inicio).localeCompare(String(b.inicio)));
+    byDate.set(k, { fecha: k, slots });
   }
+  const ordered = [...byDate.values()]
+    .filter(d => (d.slots || []).length > 0)
+    .sort((a, b) => a.fecha.localeCompare(b.fecha))
+    .slice(0, Number(session.rangeLockHabiles || HABILES_TARGET)); // ← primeros N HÁBILES
 
-  // ⬅️ IMPORTANTE: enviar el valor REAL consultado
   results.push({
     ok: true,
     tipo,
     desde: desdeFixed,
-    dias: diasUsados,              // compat
-    dias_consultados: diasUsados,  // nuevo campo
-    dias_disponibles: lista
+    dias: diasCalendar,
+    total_dias: ordered.length,
+    dias_disponibles: ordered
   });
-  session.lastSystemNote = `Consulté disponibilidad ${diasUsados}d desde ${desdeFixed} para ${tipo}.`;
   continue;
 }
-
 
 // CREAR CITA
 if (action === 'crear_cita') {
@@ -1721,17 +1853,7 @@ if (action === 'crear_cita') {
     continue;
   }
 
-  // === (Opcional) solo mes en curso
-  const nowZ = now.setZone(ZONE);
-  if (s.month !== nowZ.month || s.year !== nowZ.year) {
-    results.push({
-      ok: false,
-      error: 'fuera_de_mes',
-      message: 'En este momento solo agendamos dentro del mes en curso.'
-    });
-    session.lastSystemNote = 'Falló por fuera del mes actual.';
-    continue;
-  }
+ 
 
   // === Mínimo absoluto (si aplica)
   if (typeof MIN_BOOKING_DATE_ISO === 'string' && MIN_BOOKING_DATE_ISO) {
@@ -3039,7 +3161,7 @@ app.post('/chat', async (req, res) => {
   // ─────────────────────────────────────────────────────────
   // Fallbacks locales por si NO pegaste los helpers globales:
   // firstAllowedStart / monthPolicyFrom y constante MONTH_CUTOFF_DAY
-  const _MONTH_CUTOFF_DAY = (typeof MONTH_CUTOFF_DAY === 'number' ? MONTH_CUTOFF_DAY : 24);
+  const _MONTH_CUTOFF_DAY = (typeof MONTH_CUTOFF_DAY === 'number' ? MONTH_CUTOFF_DAY : 30);
 
   const _firstAllowedStart = (typeof firstAllowedStart === 'function')
     ? firstAllowedStart
@@ -3051,27 +3173,20 @@ app.post('/chat', async (req, res) => {
       };
 
   const _monthPolicyFrom = (typeof monthPolicyFrom === 'function')
-  ? monthPolicyFrom
-  : function(desdeISO) {
-      let start = DateTime.fromISO(desdeISO || '', { zone: ZONE });
-      if (!start.isValid) start = _firstAllowedStart(now);
+    ? monthPolicyFrom
+    : function(desdeISO) {
+        let start = DateTime.fromISO(desdeISO || '', { zone: ZONE });
+        if (!start.isValid) start = _firstAllowedStart(now);
+        const minStart = _firstAllowedStart(now);
+        if (start < minStart) start = minStart;
 
-      const minStart = _firstAllowedStart(now);
-      if (start < minStart) start = minStart;
+        const endOfMonth     = start.endOf('month').startOf('day');
+        const blocked        = start.day >= _MONTH_CUTOFF_DAY; // 24 o más
+        const nextMonthStart = start.plus({ months: 1 }).startOf('month');
+        const diasMax        = Math.max(0, Math.floor(endOfMonth.diff(start, 'days').days) + 1);
 
-      // 🔓 Ya no cortamos al fin de mes: miramos hacia adelante N días
-      const end = start.plus({ days: LOOKAHEAD_DAYS - 1 }).endOf('day');
-      const diasMax = Math.max(0, Math.floor(end.diff(start, 'days').days) + 1);
-
-      return {
-        start,                // inicio permitido
-        endOfMonth: end,      // (compat) no se usa como fin de mes ya
-        blocked: false,       // 🔓 nunca bloqueado por “corte del mes”
-        nextMonthStart: null, // (compat) ya no aplica
-        diasMax               // típicamente = LOOKAHEAD_DAYS
+        return { start, endOfMonth, blocked, nextMonthStart, diasMax };
       };
-    };
-
   // ─────────────────────────────────────────────────────────
 
   // Desbloqueo de prioridad vencida
@@ -3162,6 +3277,9 @@ const firstTimeNote =
 
   // Tomar datos del mensaje actual para ir llenando session.patient
 collectPatientFields(session, userMsg);
+const tipoEfectivo = session.tipoActual || guessTipo(userMsg) || '';
+// si no había tipo en sesión y lo inferimos, persístelo
+if (!session.tipoActual && tipoEfectivo) session.tipoActual = tipoEfectivo;
 
 // ✅ Si ya está completo el núcleo de "Primera vez", NO volver a pedirlo
 if (/primera\s*vez/i.test(tipoEfectivo) && missingForTipo(session, 'Primera vez').length === 0) {
@@ -3290,27 +3408,42 @@ if (cancelIntent) {
   };
 
 } else if (daysResp) {
-  const span = Number(daysResp.dias_consultados || daysResp.dias || DEFAULT_LOOKAHEAD_DAYS);
-  if (!daysResp.dias_disponibles.length) {
-    reply = `No tengo cupos en los próximos ${span} días. ¿Probamos otro rango?`;
+  const listaIn = Array.isArray(daysResp.dias_disponibles) ? daysResp.dias_disponibles : [];
+  if (!listaIn.length) {
+    try {
+      const texto = await showAvailabilityNowBusinessStrict(session, DateTime.now().setZone(ZONE), { force: true });
+      reply = texto || '⚠️ No pude consultar la disponibilidad.';
+
+    } catch (e) {
+      console.error('❌ Disponibilidad (daysResp vacío) error:', e);
+      reply = '⚠️ No pude consultar la disponibilidad ahora. Intenta de nuevo en unos minutos.';
+    }
   } else {
-    const lineas = daysResp.dias_disponibles.map(d => {
+    // si el modelo ya trajo lista, igual puedes normalizarla y mostrar TODO (sin cortar horas)
+    const byDate = new Map();
+    for (const d of listaIn) {
+      const k = d.fecha;
+      const prev = byDate.get(k);
+      const merged = (prev?.slots || []).concat(d.slots || []);
+      const seen = new Set();
+      const slots = merged
+        .filter(s => { const key = String(s.inicio); if (seen.has(key)) return false; seen.add(key); return true; })
+        .sort((a, b) => String(a.inicio).localeCompare(String(b.inicio)));
+      byDate.set(k, { fecha: k, slots });
+    }
+    const ordered = [...byDate.values()].filter(d => (d.slots || []).length > 0).sort((a,b)=>a.fecha.localeCompare(b.fecha));
+
+    // Aquí NO hacemos autorango ni ampliación, solo mostramos lo que vino:
+    const lineas = ordered.map(d => {
       const fecha = fmtFechaHumana(d.fecha);
       const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
       return `- ${fecha}: ${horas}`;
     }).join('\n');
+
     reply = `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
   }
-
-  session.lastOffered = {
-    tipo: session.tipoActual || 'Control presencial',
-    days: (daysResp.dias_disponibles || []).map(d => ({
-      fechaISO: d.fecha,
-      slots: (d.slots||[]).map(s => ({ inicio: s.inicio, fin: s.fin }))
-    })),
-    singleDay: (daysResp.dias_disponibles || []).length === 1
-  };
 }
+
 
 
    reply = (reply || '').trim();
@@ -3466,43 +3599,20 @@ if (
 
 
 
-       // Fallback: si pidió disponibilidad en texto libre
-// Fallback: si pidió disponibilidad en texto libre (cuando el LLM no emitió acción)
-const u = userMsg.toLowerCase();
-const pideDispon = /disponibilidad|horarios|agenda|qué días|que dias|que horarios|que horario/.test(u);
-if (pideDispon) {
+    // Fallback: si pidió disponibilidad en texto libre
+    const u = userMsg.toLowerCase();
+    const pideDispon = /disponibilidad|horarios|agenda|qué días|que dias|que horarios|que horario/.test(u);
+    if (pideDispon) {
   try {
-    const desde = _firstAllowedStart(now).toISODate();
-    const tipo  = session.tipoActual || 'Control presencial';
+    const texto = await showAvailabilityNowBusinessStrict(session, DateTime.now().setZone(ZONE), { force: true });
+    reply = texto || '⚠️ No pude consultar la disponibilidad.';
 
-    let span = DEFAULT_LOOKAHEAD_DAYS;
-    let diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias: span });
-    console.log(`[DISP/FALLBACK] tipo="${tipo}" desde=${desde} → ${span}d → days=${diasDisp.length}`);
-
-    while (!diasDisp.length && span < MAX_LOOKAHEAD_DAYS) {
-      const next = Math.min(MAX_LOOKAHEAD_DAYS, span + DEFAULT_LOOKAHEAD_DAYS);
-      console.log(`[DISP/FALLBACK] sin cupos con ${span}d → reintento con ${next}d`);
-      span = next;
-      diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias: span });
-      console.log(`[DISP/FALLBACK] reintento days=${diasDisp.length}`);
-    }
-
-    if (!diasDisp.length) {
-      reply = `No tengo cupos en los próximos ${span} días. ¿Probamos otro rango?`;
-    } else {
-      const lineas = diasDisp.map(d => {
-        const fecha = fmtFechaHumana(d.fecha);
-        const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
-        return `- ${fecha}: ${horas}`;
-      }).join('\n');
-      reply = `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
-    }
+    reply = texto || '⚠️ No pude consultar la disponibilidad.';
   } catch (e) {
     console.error('❌ Fallback disponibilidad error:', e);
     reply = '⚠️ No pude consultar la disponibilidad ahora. Intenta de nuevo en unos minutos.';
   }
 }
-
 
 
     reply = stripActionBlocks(reply);
@@ -3539,7 +3649,7 @@ app.post('/availability', async (req, res) => {
 app.post('/availability-range', async (req, res) => {
   try {
     const { tipo = 'Control presencial' } = req.body;
-    let { desde, dias = 60 } = req.body;
+    let { desde, dias = 30 } = req.body;
     if (!desde) return res.status(400).json({ ok: false, error: 'falta_desde' });
 
     const desdeFixed = coerceFutureISODateOrToday(desde);

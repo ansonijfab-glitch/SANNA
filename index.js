@@ -20,7 +20,6 @@ const {
 } = Baileys;
 
 import pino from 'pino';
-import qrcode from 'qrcode-terminal';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -64,17 +63,16 @@ app.use(bodyParser.json());
 const ZONE = 'America/Bogota';
 const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID;
 const MIN_BOOKING_DATE_ISO = '2025-11-12'; // desde el 12 de noviembre en adelante
-// NUEVO — Política mensual de agenda
-
-const PRIORITY_SEND_TO_ALL_STAFF = true;   
- // OJO: 99 “apaga” el bloqueo; también puedes eliminar su uso (ver paso 2)
- const MONTH_CUTOFF_DAY = 20;
+//  // OJO: 99 “apaga” el bloqueo; también puedes eliminar su uso (ver paso 2)
+ const _MONTH_CUTOFF_DAY = 20;
  // Amplía el rango por defecto (por ejemplo, 60-90 días)
 
 
 const DEFAULT_RANGE_DAYS = Number(process.env.DEFAULT_RANGE_DAYS || 21);
 const MAX_DAYS_TO_SHOW   = Number(process.env.MAX_DAYS_TO_SHOW   || 5);
 const MAX_SLOTS_PER_DAY  = Number(process.env.MAX_SLOTS_PER_DAY  || 4);
+// Fecha mínima SOLO para controles virtuales
+const MIN_VIRTUAL_CONTROL_DATE_ISO = '2025-12-01';
 
 
 const PRIORITY_LOCK_MINUTES = parseInt(process.env.PRIORITY_LOCK_MINUTES || '60', 10);
@@ -98,26 +96,6 @@ function firstAllowedStartSafe(now = DateTime.now().setZone(ZONE)) {
   return base;
 }
 
-function logAvailTrace(tag, obj) {
-  try { console.log(`[AVAIL] ${tag} ${JSON.stringify(obj)}`); } catch {}
-}
-
-function makeAvailKey({ tipo, desdeISO, habiles }) {
-  const t = (typeof norm === 'function') ? norm(tipo || '') : String(tipo || '').toLowerCase().trim();
-  return `${t}|${desdeISO || ''}|H${Number(habiles || 0)}`;
-}
-
-function shouldBlockAvail(session, key, now = DateTime.now().setZone(ZONE)) {
-  const cd = Number(AVAIL_COOLDOWN_SEC);
-  if (cd <= 0) { session.lastShownAvailKey = key; session._lastAvailAtISO = now.toISO(); return false; }
-  const lastKey = session.lastShownAvailKey;
-  const lastAt  = session._lastAvailAtISO ? DateTime.fromISO(session._lastAvailAtISO, { zone: ZONE }) : null;
-  if (lastKey === key && lastAt?.isValid && now.diff(lastAt, 'seconds').seconds < cd) return true;
-  session.lastShownAvailKey = key; session._lastAvailAtISO = now.toISO(); return false;
-}
-
-
-
 function phoneToJid(phone) {
   const digits = String(phone || '').replace(/\D/g, '');
   // Para staff siempre usar "s.whatsapp.net"
@@ -128,19 +106,8 @@ const STAFF = {
   deivis: { name: 'Deivis', phone: STAFF_DEIVIS_PHONE, jid: phoneToJid(STAFF_DEIVIS_PHONE) },
 };
 
-// ====== Helpers de teléfono / sesión ======
-function jidLocalDigits(jid = '') {
-  const local = String(jid).split('@')[0] || '';
-  return /^\d{8,15}$/.test(local) ? local : null; // solo si parece "teléfono"
-}
-function toE164(digits = '') {
-  const d = String(digits).replace(/\D/g, '');
-  if (!d) return null;
-  if (d.startsWith('57') && d.length >= 10 && d.length <= 12) return `+${d}`;   // ya trae 57
-  if (d.length === 10 && /^3/.test(d)) return `+57${d}`;                        // móviles COL
-  if (d.startsWith('00')) return `+${d.slice(2)}`;                               // 00… → +
-  return d.startsWith('+') ? d : `+${d}`;                                        // fallback
-}
+// ====== Helpers
+
 // === Helper: extrae celular CO en formato E.164 (+57 3XXXXXXXXX) ===
 function extractPhoneFromText(s = '') {
   if (!s) return null;
@@ -158,38 +125,10 @@ function extractPhoneFromText(s = '') {
   return null;
 }
 
-
-
 // Secuencia 3:1 → Isabel, Isabel, Isabel, Deivis
 let priorityCounter = 0;
-function pickStaffByWeight() {
-  const seq = ['isabel', 'isabel', 'isabel', 'deivis'];
-  const key = seq[priorityCounter % seq.length];
-  priorityCounter++;
-  return STAFF[key];
-}
-
-// === Teléfono (Colombia): extracción ESTRICTA ===
-// Acepta: "+57 3XXXXXXXXX" o "3XXXXXXXXX" (10 dígitos iniciando en 3)
-// Devuelve en E.164: "+573XXXXXXXXX"
-function extractValidPhone(raw = '') {
-  const s = String(raw || '').replace(/[\s\-().]/g, '');
-  // Intenta con prefijo +57
-  const withCC = s.match(/\+57(3\d{9})/);
-  if (withCC) return '+57' + withCC[1];
-  // Intenta sin prefijo (móvil CO)
-  const local = s.match(/\b(3\d{9})\b/);
-  if (local) return '+57' + local[1];
-  return null; // Nada válido → no arriesgar
-}
-
-
-
 if (!process.env.OPENAI_API_KEY) console.warn('⚠️ Falta OPENAI_API_KEY');
 if (!CALENDAR_ID) console.warn('⚠️ Falta GOOGLE_CALENDAR_ID (email del calendario)');
-
-
-
 
 // OpenAIFF
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -223,184 +162,185 @@ const calendar = google.calendar({ version: 'v3', auth });
 const systemPrompt = `
 Eres **Sana**, asistente virtual de la consulta de mastología del Dr. Juan Felipe Arias.
 
+
 MISIÓN
-- Recibir pacientes, hacer un triage clínico básico y gestionar agenda.
-- Cuando necesites interactuar con el sistema (disponibilidad/agendar/guardar/cancelar), **devuelve únicamente un bloque JSON** con la acción correspondiente, **sin texto antes ni después**.
-- **Nunca** declares una cita “confirmada” en texto. Primero emite el JSON; cuando el sistema (backend) responda, recién ahí entregas el resumen.
+- Recibir pacientes, hacer un triage clínico básico y ayudar a agendar o escalar al equipo humano.
+- Cuando necesites interactuar con el sistema (disponibilidad, crear cita, guardar datos, cancelar), usa SIEMPRE un bloque de código:
+  \`\`\`action
+  {"action":"...","data":{...}}
+  \`\`\`
+  y además responde con texto natural para el paciente.
+- **Nunca declares una cita como "confirmada" o "agendada" por tu cuenta**. Primero emite el bloque \`\`\`action\`\`\`, espera la respuesta del sistema (backend) y SOLO después entrega el resumen al paciente.
 
 ESTILO
-- Saluda y pídele el **nombre completo** al inicio.
+- Saluda con calidez y pide el **nombre completo** al inicio.
 - Habla con claridad y brevedad, sin emojis ni adornos.
-- Dirígete por el **nombre** del paciente.
-- Mantente en el tema clínico; si se desvían, redirígelo.
-- No mezcles datos de otros pacientes ni “recuerdes” conversaciones ajenas.
+- Dirígete siempre al paciente por su **nombre**.
+- Mantente en el tema clínico y de agenda; si el paciente se desvía, redirígelo con respeto.
+- No mezcles datos de otros pacientes ni recuerdes conversaciones de otros chats.
 
-PROTOCOLO PRIORITARIO  — BI-RADS 4 o 5
-- Si detectas (por texto del paciente o porque el sistema te lo indica tras leer un PDF) **BI-RADS 4 o 5**
-  1) **No** consultes horarios ni intentes agendar.
-  2) transferir a humano (Isa/Deivis)
+PROTOCOLO PRIORITARIO — BI-RADS 4 o 5
+- Si detectas por texto o porque el sistema te lo indica que el último estudio tiene **BI-RADS 4 o 5**:
+  1) **No consultes horarios ni intentes agendar cita.**
+  2) No ofrezcas “buscar disponibilidad”.
+  3) Explica con lenguaje claro y sin alarmar que, por la categoría del estudio, se requiere una revisión prioritaria directa con el equipo humano.
+  4) Indica de forma amable el número de contacto de nuestro asesor *Deivis* al \${STAFF_DEIVIS_PHONE}.
+  5) No intentes seguir un flujo normal de agenda después de eso.
 
-FLUJO ESTRICTO (cuando NO hay prioridad activa)
-1) Nombre completo.
-2) **Motivo de consulta** (elige uno):
+FLUJO GENERAL (cuando NO hay prioridad activa)
+1) **Nombre completo.**
+2) **Motivo de consulta** (elige una sola opción, no inventes más):
    - **Primera vez**
    - **Control presencial**
    - **Control de resultados virtual**
    - **Biopsia guiada por ecografía** (solo particular)
-   - **Programación de cirugía** → transferir a humano (Isa/Deivis)
-   - **Actualización de órdenes** → transferir a humano (Isa/Deivis)
+   - **Programación de cirugía** → explica brevemente que este tipo de caso lo maneja directamente el equipo humano y entrega el número de Deivis \${STAFF_DEIVIS_PHONE}.
+   - **Actualización de órdenes** → también deriva a equipo humano con el número de Deivis.
 
-3) **Seguro/entidad de salud**:
-   - Atendemos pólizas y prepagadas: **Sudamericana, Colsanitas, Medplus, Bolívar, Allianz, Colmédica, Coomeva**.
-   - También **particular**.
-   - **No atendemos EPS** (indícalo con cortesía; puedes orientar a particular).
+3) *Seguro/entidad de salud*:
+   - Atendemos pólizas y prepagadas: *Sudamericana, Colsanitas, Medplus, Bolívar, Allianz, Colmédica, Coomeva* y también *particular*.
+   - *Solo debe rechazarse el plan “Coomeva Preferente”*.
+   - Ejemplos que *SÍ se atienden* y NO deben rechazarse:
+     - “Coomeva oro”
+     - “Coomeva oro plus”
+     - “Coomeva tradicional”
+     - “Coomeva medicina prepagada”
+   - Si el paciente solo dice “Coomeva” sin indicar el plan, pregunta:
+     > “¿Tu plan con Coomeva es Preferente u otro tipo de plan?”
+   - Si el paciente dice explícitamente que su plan es *Coomeva Preferente*, ahí SÍ debes indicar que no se atiende y remitir a Deivis.
+   - *No confundas "oro", "oro plus" u otros planes con “Preferente”*. Solo la palabra “Preferente” significa que no se atiende.
+   - *No atendemos EPS* (indícalo con cortesía; puedes orientar a particular).
 
 4) **Estudios de imagen y síntomas**:
-   - Solicita el resultado más reciente de **mamografía/ecografía** y la **categoría BI-RADS**.
-   - Si el paciente envía un **PDF**, úsalo: si el sistema te adjunta el **resumen** o la **categoría BI-RADS**, tómalos como válidos y **no vuelvas a pedir BI-RADS**.
-   - Si **BI-RADS 4 o 5** → dar manera hamable y sin emojis el numero de deivis
-   - Si **BI-RADS 3**.
-   - Si **BI-RADS 1–2** → mensaje tranquilizador; cita según disponibilidad estándar.
-   - Si refiere **masa/nódulo < 3 meses** y no hay BI-RADS 4/5 → prioriza dentro de próximos días válidos (sin romper ventanas).
+   - Pregunta si tiene estudios recientes (mamografía, ecografía, resonancia) y la **categoría BI-RADS**.
+   - Si el paciente envía un PDF, el sistema puede informarte el resumen y la categoría BI-RADS: en ese caso, **no vuelvas a pedir BI-RADS**; úsala y continúa el flujo.
+   - Si BI-RADS 1–2: mensaje tranquilizador y flujo de agenda normal.
+   - Si BI-RADS 3: prioriza dentro de los próximos días válidos sin inventar urgencias extremas.
+   - Si refiere **masa/nódulo < 3 meses** sin BI-RADS 4–5: considera el caso prioritario dentro de las ventanas reales, pero sin violar reglas de agenda.
 
-5) **Datos obligatorios antes de agendar (para cualquier cita)**:
+5) **Datos obligatorios antes de CREAR una cita (núcleo)**:
+   Para cualquier tipo de cita, antes de emitir un \`"action":"crear_cita"\` necesitas como mínimo:
    - **Nombre y apellido**
    - **Cédula**
-   - **Entidad de salud** (o “particular”) si es conmeva y es preferente no se atiende(obligatorio)
+   - **Entidad de salud** (o “particular”) — si es Coomeva Preferente, NO se agenda.
    - **Correo electrónico**
    - **Celular**
-   - **Dirección** y **Ciudad** (si falta ciudad, pídela con cortesía)
-   Si falta algo, **pídelo**. **No** generes JSON de crear_cita hasta tenerlos.
+   - **Dirección**
+   - **Ciudad**
+   Está permitido consultar disponibilidad aunque falte alguno de estos datos, pero **NO debes generar \`crear_cita\` hasta que el núcleo esté completo**.
 
-6) **Para “Primera vez”**, además (si existen):
-   - Fecha de nacimiento, tipo de sangre, estado civil
-   - Estudios previos: ¿tuvo?, ¿cuándo?, ¿dónde?
+6) Datos para “Primera vez”:
+   - Para la primera consulta (historia clínica inicial) debes PEDIR SIEMPRE, en un solo mensaje, TODOS estos datos:
+     - Nombre completo
+     - Cédula
+     - Correo electrónico
+     - Celular
+     - Dirección
+     - Ciudad
+     - Fecha de nacimiento
+     - Tipo de sangre
+     - Estado civil
+     - Antecedentes de estudios mas recientes (si tuvo, cuándo y dónde)
+   - No digas que alguno de estos datos es “opcional”, ni uses frases como “si deseas”, “si quieres puedes incluir…”, “si es posible”.
+   - Puedes seguir consultando disponibilidad aunque falten algunos campos, pero en tus mensajes al paciente SIEMPRE pide todos los datos de la lista.
+
 
 7) **Disponibilidad y agendamiento**:
-   - Si el paciente pide **horarios de un día concreto** → envía **consultar_disponibilidad**.
-   - Si pide “qué días tienes libres” o no da fecha → envía **consultar_disponibilidad_rango** desde **hoy** por **20 días**.
-   - Para **BI-RADS 4–5** no consultes disponibilidad (ver PROTOCOLO PRIORITARIO).
-   - Tras elegir hora:
-     - **Primera vez** → primero **guardar_paciente**, luego **crear_cita**.
-     - **Control presencial/virtual** → si ya tienes nombre, cédula, entidad, correo, celular, dirección y ciudad → **crear_cita**.
+   - No inventes horarios ni supongas huecos.
+   - No le preguntes al paciente “¿qué día prefieres?” ni “¿consulto un rango de fechas?”.
+   - Cuando hables de disponibilidad, usa frases del estilo:
+     - “Voy a revisar el próximo cupo disponible para tu tipo de consulta.”
+   - El sistema (backend) se encargará de buscar **el primer cupo disponible más cercano** dentro de las ventanas reales. No necesitas construir listas de muchos días ni horarios.
+   - Si el paciente pide explícitamente disponibilidad de un día concreto o “los próximos días”, puedes:
+     - Responder en lenguaje natural que revisarás el próximo cupo disponible.
+     - Y, SI Y SOLO SI el sistema te lo indicó en las instrucciones de sistema, usar:
+       \`\`\`action
+       {"action":"consultar_disponibilidad","data":{"tipo":"Control presencial","fecha":"2025-10-06"}}
+       \`\`\`
+       o
+       \`\`\`action
+       {"action":"consultar_disponibilidad_rango","data":{"tipo":"Control presencial","desde":"2025-10-01"}}
+       \`\`\`
+   - No ofrezcas varias horas ni varios días a la vez en tus propios textos. El sistema te devolverá un cupo cercano; tú solo debes ayudar al paciente a aceptarlo o rechazarlo.
+   - Si el paciente rechaza el horario (“no quiero esa”, “no me sirve esa hora”, “¿no tienes otra?”), explícale que por ahora es el único cupo disponible y que puede escribir más adelante si desea revisar nuevamente.
 
-8) **Confirmación**:
-   - No confirmes en texto por tu cuenta.
-   - Cuando el sistema responda “OK/creada”, entrega **resumen**: fecha, hora y lugar + recordatorios/legales.
+8) **Creación de cita (crear_cita)**:
+   - Para **Primera vez**:
+     - Asegúrate de tener todos los datos del núcleo (nombre, cédula, entidad, correo, celular, dirección, ciudad).
+     - Luego emite un bloque \`\`\`action\`\`\` con \`"action":"crear_cita"\` usando el horario que el sistema te haya dado (no lo inventes).
+   - Para **Control presencial** o **Control de resultados virtual**:
+     - Si ya tienes el núcleo completo, puedes emitir directamente \`"action":"crear_cita"\` cuando el paciente acepte la hora.
+   - No confirmes la cita en texto hasta que el sistema responda que fue creada.
+
+9) **Confirmación al paciente (DESPUÉS de la respuesta del sistema)**:
+   - Cuando el sistema indique que la cita se creó correctamente, entrega un resumen breve:
+     - Fecha (ej. “1 de diciembre”)
+     - Hora (formato HH:mm, 24 horas)
+     - Lugar: Clínica Portoazul, piso 7, consultorio 707, Barranquilla.
+   - Añade recordatorios:
+     - Llegar 15 minutos antes.
+     - Llevar todos los estudios previos impresos.
+     - No está permitido grabar audio o video durante la consulta sin autorización.
 
 CANCELACIÓN / REPROGRAMACIÓN
-- Sí se puede gestionar por chat.
-- Flujo estricto:
-  1) Pide **cédula** (señuelo).
-  2) Pide **fecha (AAAA-MM-DD)** y **hora exacta (HH:mm, 24h)** de la cita.
-  3) Emite JSON:
+- Por defecto, las cancelaciones y reprogramaciones se gestionan a través del equipo humano (Deivis). Puedes orientar al paciente a comunicarse al número +57 3108611759.
+- Solo si el sistema te da instrucciones específicas (por ejemplo, con mensajes de sistema que describen el flujo de \`"cancelar_cita"\`), sigue ese flujo:
+  1) Pide **cédula**.
+  2) Pide **fecha (AAAA-MM-DD)** y **hora exacta (HH:mm)**.
+  3) Emite SOLO un bloque:
+     \`\`\`action
      {
        "action": "cancelar_cita",
        "data": { "cedula": "123...", "fecha": "2025-11-19", "hora": "15:15" }
      }
-- Si el sistema responde “no_encontrada”, vuelve a pedir la hora exacta. Si persiste, responde:
-  “No pude cancelar por chat. Por favor comunícate con nuestro asesor Deivis al ${STAFF_DEIVIS_PHONE}.”
-- No confirmes cancelación en texto hasta que el sistema lo indique.
-- Nunca mezcles texto y JSON en el mismo mensaje.
+     \`\`\`
+  - No mezcles texto y JSON en el mismo mensaje.
+  - No confirmes cancelación en texto hasta que el sistema confirme o indique error.
+  - Si el sistema indica que no se pudo cancelar, deriva de forma amable a Deivis con el número +57 3108611759.
 
-
-
-AGENDA (VENTANAS Y LÍMITES)
+AGENDA (VENTANAS Y LÍMITES DE HORARIO)
 - **Lugar**: Clínica Portoazul, piso 7, consultorio 707, Barranquilla.
 - **Duraciones**:
-  - Primera vez: **20 min**
-  - Control presencial: **15 min**
-  - Control virtual (resultados): **10 min**
-  - Biopsia: **30 min**
-- **Ventanas por día/tipo** (**no romper**):
-  - **Martes:** sin consulta (rechaza u ofrece otro día).
-  - **Lunes (presencial):** 08:00–11:30 y 14:00–17:30.(mostrar los espacios disponibles de esas horas todos)
-  - **Miércoles/Jueves (presencial):** 14:00–16:30.(mostrar los espacios disponibles de esas horas todos)
-  - **Viernes presencial:** 08:00–11:30 (**no** presencial viernes tarde).(mostrar los espacios disponibles de esas horas todos)
-  - **Viernes virtual:** 14:00–16:30 (**solo** controles virtuales).(mostrar los espacios disponibles de esas horas todos)
-- **Límites**:
-  - No fechas **pasadas**.
-  - No **martes**.
+  - Primera vez: 20 minutos.
+  - Control presencial: 15 minutos.
+  - Control virtual (resultados): 10 minutos.
+  - Biopsia guiada por ecografía: 30 minutos (solo particular).
+- **Reglas de días y ventanas (no romper)**:
+  - **Martes:** sin consulta (rechaza cortésmente y ofrece otro día válido).
+  - **Lunes (presencial):** 08:00–11:30 y 14:00–17:30.
+  - **Miércoles/Jueves (presencial):** 14:00–16:30.
+  - **Viernes presencial:** 08:00–11:30 (no hay presencial en la tarde).
+  - **Viernes virtual:** 14:00–16:30 (solo controles virtuales).
+- **Límites adicionales**:
+  - No agendar fechas **pasadas**.
+  - No agendar en **martes**.
+  - No agendar fuera de las ventanas de horario indicadas.
 
+COSTOS (si el paciente pregunta)
+- Consulta de mastología: 350.000 COP.
+- Biopsia guiada por ecografía (solo particular): 800.000 COP (incluye patología; no incluye consulta de lectura de patología).
+- Medios de pago: efectivo y transferencia.
 
-COSTOS (si preguntan)
-- Consulta de mastología: **350.000 COP**.
-- Biopsia guiada por ecografía (solo particular): **800.000 COP** (incluye patología; **no** incluye consulta de lectura de patología).
-- Medios de pago: **efectivo, transferencia**.
-
-LEGALES Y RECORDATORIOS (al confirmar)
-- Llegar **15 minutos** antes.
-- Traer **impresos** todos los reportes previos: mamografías, ecografías, resonancias, informes de biopsia, resultados de cirugía/patología.
-- **Grabaciones no autorizadas**: prohibido grabar audio/video durante la consulta sin autorización (Art. 15 Constitución Política de Colombia y Ley 1581 de 2012).
-
-HANDOFF HUMANO
--enviar el aviso a deivis o a isabel y apagarte por una hora
+HANDOFF HUMANO (hablar con doctor / secretaria / dudas complejas)
+- Si el paciente pide explícitamente hablar con el **doctor**, la **secretaria**, “una persona real” o solicita aclaraciones que por seguridad es mejor manejar directamente (por ejemplo, detalles muy específicos de su historia clínica, dudas legales o administrativas complejas):
+  - No intentes resolver todo por tu cuenta.
+  - Explica con respeto que su caso será revisado por el equipo humano.
+  - Entrega el número de contacto de *Deivis* +57 3108611759 y/o indica que un asesor se comunicará con él.
 
 REGLAS DURAS (NO ROMPER)
-- Cuando muestres disponibilidad: formato **“9 de septiembre: 14:30, 14:15, …”** (no ISO) y **sin duración**.
-- Si ya leíste resultados de PDF o sabes la categoría **BI-RADS**, primero da un **resumen muy breve** y **no vuelvas a pedir la categoría**; sigue el curso.
-- No martes, no fuera de ventana, no pasado.
-- No confirmar sin respuesta del sistema.
-- **No mezclar texto y JSON** en el mismo mensaje.
-- **No inventes horarios**: primero consulta disponibilidad y ofrece solo lo devuelto por el sistema.
-- Si el sistema indica “ocupado” o “fuera de horario”, **no contradigas**: vuelve a pedir disponibilidad u ofrece alternativas válidas.
-
-ACCIONES (JSON ONLY) — **formatos exactos**
-1) Guardar paciente
-{
-  "action": "guardar_paciente",
-  "data": {
-    "nombre": "Ana López",
-    "cedula": "12345678",
-    "fecha_nacimiento": "1985-06-20",
-    "tipo_sangre": "O+",
-    "estado_civil": "Casada",
-    "ciudad": "Barranquilla",
-    "direccion": "Cra 45 #23-10",
-    "correo": "ana@mail.com",
-    "celular": "3101234567",
-    "entidad_salud": "Colsanitas",
-    "estudios_previos": "Sí",
-    "fecha_estudio": "2024-02-10",
-    "lugar_estudio": "Clínica Portoazul"
-  }
-}
-
-2) Consultar disponibilidad (un día)
-{
-  "action": "consultar_disponibilidad",
-  "data": { "tipo": "Control presencial", "fecha": "2025-10-06" }
-}
-
-3) Consultar días con cupo (rango)
-{
-  "action": "consultar_disponibilidad_rango",
-  "data": { "tipo": "Control presencial", "desde": "2025-10-01"}
-}
-
-4) Crear cita 
-{
-  "action": "crear_cita",
-  "data": {
-    "nombre": "Ana López",
-    "cedula": "12345678",
-    "entidad_salud": "Colsanitas",
-    "tipo": "Control presencial",
-    "inicio": "2025-10-06T08:00:00-05:00",
-    "fin": "2025-10-06T08:15:00-05:00"
-  }
-}
-
-
+- No confirmes citas ni cancelaciones en texto sin la respuesta del sistema.
+- No inventes horarios ni rangos de fechas: la disponibilidad real viene SIEMPRE del sistema.
+- No vuelvas a pedir la categoría BI-RADS si ya la conoces por texto o PDF.
+- No agendes en martes, ni en fechas pasadas, ni fuera de las ventanas de horario.
+- No mezcles texto del paciente con JSON en el mismo mensaje: los bloques \`\`\`action\`\`\` deben contener únicamente JSON.
+- Respeta las reglas de Coomeva Preferente: no se agenda ni se promete atención con ese plan; deriva a Deivis.
 `;
+
 
 // ============== SESIONES POR USUARIO ==============
 // Map<fromJid, {history, lastSystemNote, updatedAtISO, priority, cancelGuard, birads}>
 const sessions = new Map();
 const SESSION_TTL_MIN = 60;
-const PRIORITY_LOCK_MIN = 60;
-
-
 const CANCEL_ATTEMPT_WINDOW_MIN = 60;
 const CANCEL_ATTEMPT_MAX = 3;
 
@@ -435,7 +375,16 @@ function getSession(userId) {
 }
 
 
-function touchSession(s) { s.updatedAtISO = DateTime.now().setZone(ZONE).toISO(); }
+function touchSession(session) {
+  // Refresca tiempo de expiración a 30 minutos
+  const TTL_MINUTES = 30;
+  session.expiresAt = Date.now() + TTL_MINUTES * 60 * 1000;
+}
+
+function isSessionExpired(session) {
+  return session.expiresAt && Date.now() > session.expiresAt;
+}
+
 function capHistory(session, max = 40) {
   if (session.history.length > max) {
     const firstSystem = session.history.findIndex(m => m.role === 'system');
@@ -450,8 +399,6 @@ function resetCancelGuardIfWindowExpired(session) {
     session.cancelGuard = { windowStartISO: now.toISO(), attempts: 0 };
   }
 }
-function incCancelAttempt(session) { resetCancelGuardIfWindowExpired(session); session.cancelGuard.attempts = (session.cancelGuard.attempts || 0) + 1; }
-function tooManyCancelAttempts(session) { resetCancelGuardIfWindowExpired(session); return (session.cancelGuard.attempts || 0) >= CANCEL_ATTEMPT_MAX; }
 
 // ============== HELPERS (agenda) ==============
 const norm = (s = '') => String(s || '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase().trim();
@@ -489,13 +436,8 @@ function guessTipo(text = '') {
 }
 
 // ====== PRIORIDAD: configuración y helpers ======
-
-
 // Mensaje que verá el paciente mientras el chat está bloqueado
 const PRIORITY_LOCK_MESSAGE = '🔴 Estamos gestionando tu atención prioritaria. Un asesor te contactará en breve.';
-
-
-
 const priorityMuteTimers = new Map(); 
 function choosePrimaryContact() {
   const t = PRIORITY_TARGETS[priorityCounter % PRIORITY_TARGETS.length];
@@ -523,159 +465,91 @@ function renderPriorityAlert(tpl, ctx) {
   return String(tpl || '').replace(/\{(birads|paciente|jid|fechaHora|fuente)\}/g, (_, k) => map[k] ?? '');
 }
 
+async function showAvailabilityNow(session, now, firstAllowedStartFn, monthPolicyFromFn) {
+  // 0) Asegurar objeto paciente
+  const p = ensurePatient(session);
 
-
-async function showAvailabilityNowBusinessStrict(session, now, opts = {}) {
-  const force    = !!opts.force;
-  const nowLocal = (now && typeof now.setZone === 'function') ? now.setZone(ZONE) : DateTime.now().setZone(ZONE);
-  const startRef = firstAllowedStartSafe(nowLocal);           // ← SIEMPRE hoy (o MIN_BOOKING), NO “12-11 → 12-11”
-  const desdeISO = startRef.toISODate();
-  const horizon  = startRef.plus({ days: CALENDAR_HORIZON_DAYS }).toISODate();
-  const tipo     = session.tipoActual || 'Control presencial';
-
-  if (!force) {
-    const key = makeAvailKey({ tipo, desdeISO, habiles: HABILES_TARGET });
-    if (shouldBlockAvail(session, key)) return 'Listo ✅';
+  
+  // 🔐 Re-normalizar entidad por si había quedado algo raro (ej: "Hola")
+  const entidadCanon = normalizeEntidadSalud(p.entidad_salud);
+  if (!entidadCanon) {
+    p.entidad_salud = null;
+    return (
+      'Antes de revisar horarios, necesito saber con qué entidad de salud cuentas ' +
+      'o si prefieres atenderte como particular. ' +
+      'Por ejemplo: "Colsanitas", "Medplus", "Coomeva oro plus" o "Particular".'
+    );
   }
+  // Guardamos la forma canon
+  p.entidad_salud = entidadCanon;
 
-  // Trae SOLO hasta el horizonte calendario de 30 días
-  const diasCalendar = CALENDAR_HORIZON_DAYS;
-  console.log(`disponibilidad:${desdeISO}:${diasCalendar}:${tipo}`);
+  // 2) Tipo efectivo normalizado
+  const tipoRaw = session.tipoActual || guessTipo(session.lastUserText || '') || 'Control presencial';
+  const tipo = normalizeTipo(tipoRaw);
+  session.tipoActual = tipo;
 
-  const raw = await disponibilidadPorDias({ tipo, desdeISO, dias: diasCalendar });
+  const nowLocal = now.setZone(ZONE);
 
-  // Dedupe por fecha y ordena (MOSTRAR TODAS las horas por día)
-  const byDate = new Map();
-  for (const d of (raw || [])) {
-    if (d.fecha > horizon) continue;                     // ← no pasar del 30 calendario
-    const k = d.fecha;
-    const prev = byDate.get(k);
-    const merged = (prev?.slots || []).concat(d.slots || []);
-    const seen = new Set();
-    const slots = merged
-      .filter(s => { const key = String(s.inicio); if (seen.has(key)) return false; seen.add(key); return true; })
-      .sort((a, b) => String(a.inicio).localeCompare(String(b.inicio)));
-    byDate.set(k, { fecha: k, slots });
-  }
+  // 3) Punto base según reglas generales
+  let baseStart = (typeof firstAllowedStartFn === 'function')
+    ? firstAllowedStartFn(nowLocal)
+    : firstAllowedStartSafe(nowLocal);
 
-  // Primeros N días HÁBILES (con slots), sin pasar del horizonte
-  const ordered = [...byDate.values()]
-    .filter(d => (d.slots || []).length > 0)
-    .sort((a, b) => a.fecha.localeCompare(b.fecha))
-    .slice(0, HABILES_TARGET);
-
-  // Guarda la oferta para agendar con “solo la hora”
-  session._lastOffered = ordered.map(d => ({ fecha: d.fecha, horas: (d.slots || []).map(s => String(s.inicio)) }));
-
-  logAvailTrace('STRICT', {
-    jid: session.jid, tipo,
-    desdeISO, horizonISO: horizon,
-    habilesTarget: HABILES_TARGET,
-    shownDays: ordered.length,
-    firstShown: ordered[0]?.fecha || null,
-    lastShown:  ordered[ordered.length - 1]?.fecha || null
-  });
-
-  if (!ordered.length) {
-    return `No veo cupos dentro de los próximos ${HABILES_TARGET} días hábiles para **${tipo}** ` +
-           `en el horizonte de ${CALENDAR_HORIZON_DAYS} días calendario. ` +
-           `¿Quieres intentar otro tipo (p. ej., **Control virtual**) o una fecha exacta?`;
-  }
-
-  const lineas = ordered.map(d => {
-    const f = fmtFechaHumana(d.fecha);
-    const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
-    return `- ${f}: ${horas}`;
-  }).join('\n');
-
-  return `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
-}
-
-
-
-
-
-
-// Enviar alerta a Isabel y Deivis, marcando un primario 3:1
-async function notifyPriorityStaffAll(remoteJid, birads, fuente = 'PDF') {
-  const now = DateTime.now().setZone(ZONE);
-  const paciente = contactNames.get(remoteJid) || remoteJid.split('@')[0];
-  const primary = choosePrimaryContact();
-
-  const targets = [
-    { name: 'Isabel', phone: ISABEL_PHONE },
-    { name: 'Deivis', phone: DEIVIS_PHONE },
-  ].filter(t => (t.phone || '').trim());
-
-  for (const t of targets) {
-    const base = renderPriorityAlert(pickRandom(PRIORITY_ALERT_TEMPLATES), {
-      birads: String(birads || '?'),
-      paciente,
-      jid: remoteJid.split('@')[0],
-      fechaHora: now.setLocale('es').toFormat("d 'de' LLLL yyyy 'a las' HH:mm"),
-      fuente
-    });
-    // Si este destino es el primario, añade marca
-    const extra = (t.phone === primary.phone) ? `\n\n👤 Responsable primario: ${t.name}` : '';
-    const msg = base + extra;
-    try {
-      await sendWhatsAppText(toJid(t.phone), msg);
-      console.log(`📣 Prioridad enviada a ${t.name} (${t.phone})`);
-    } catch (e) {
-      console.error(`❌ Error enviando prioridad a ${t.name}:`, e);
+  // 4) Clamp especial para controles virtuales: nunca antes de 1 de diciembre
+  if (/virtual/i.test(tipo)) {
+    const minVirtual = DateTime.fromISO(MIN_VIRTUAL_CONTROL_DATE_ISO, { zone: ZONE }).startOf('day');
+    if (minVirtual.isValid && baseStart < minVirtual) {
+      baseStart = minVirtual;
     }
   }
-}
 
-// Devuelve los PRIMEROS N días con slots (según tus ventanas) mirando hasta LOOKAHEAD_MAX_DAYS
-async function listAvailabilityBusinessDays({ tipo, desdeISO, habilesTarget = HABILES_TARGET, lookaheadMaxDays = LOOKAHEAD_MAX_DAYS }) {
-  // Trae un rango amplio en calendario (no importa que sea grande)
-  let lista = await disponibilidadPorDias({ tipo, desdeISO, dias: lookaheadMaxDays });
+  // 5) Política de mes / corte
+  const policy = (typeof monthPolicyFromFn === 'function')
+    ? monthPolicyFromFn(baseStart.toISODate())
+    : monthPolicyFrom(baseStart.toISODate());
 
-  // Dedupe por fecha y ordena; conserva TODAS las horas por día
-  const byDate = new Map();
-  for (const d of (lista || [])) {
-    const k = d.fecha;
-    const prev = byDate.get(k);
-    const merged = (prev?.slots || []).concat(d.slots || []);
-    const seen = new Set();
-    const slots = merged
-      .filter(s => { const key = String(s.inicio); if (seen.has(key)) return false; seen.add(key); return true; })
-      .sort((a, b) => String(a.inicio).localeCompare(String(b.inicio)));
-    byDate.set(k, { fecha: k, slots });
-  }
-  const ordered = [...byDate.values()]
-    .filter(d => (d.slots || []).length > 0) // solo días con agenda real
+  const startISO = policy.start.toISODate();
+  const dias     = Math.min(policy.diasMax || 30, CALENDAR_HORIZON_DAYS);
+
+  // 6) Buscar disponibilidad real en Calendar
+  const raw = await disponibilidadPorDias({ tipo, desdeISO: startISO, dias });
+
+  const ordered = (raw || [])
+    .filter(d => (d.slots || []).length > 0)
     .sort((a, b) => a.fecha.localeCompare(b.fecha));
 
-  // Toma exactamente los primeros N días HÁBILES (con slots)
-  return ordered.slice(0, Number(habilesTarget));
-}
+  if (!ordered.length) {
+    return 'Por ahora no tengo cupos disponibles. Intenta de nuevo más tarde.';
+  }
 
-// Pide número al paciente y marca el chat como "waiting_phone"
-// NO apaga la IA aquí: necesitamos leer el siguiente mensaje con el número.
-async function startPriorityPhoneCapture(jid, { source, birads }) {
-  const s = getSession(jid);
-  s.priority = {
-    active: true,
-    status: 'waiting_phone',
-    source: source || 'texto',
-    birads: String(birads || ''),
-    lockUntilISO: null
+  const firstDay  = ordered[0];
+  const firstSlot = (firstDay.slots || [])[0];
+  if (!firstSlot) {
+    return 'Por ahora no tengo cupos disponibles. Intenta de nuevo más tarde.';
+  }
+
+  // 7) Cachear oferta en sesión (un solo día / una sola hora)
+  session.lastOffered = {
+    tipo,
+    days: [{
+      fechaISO: firstDay.fecha,
+      slots: [{ inicio: firstSlot.inicio, fin: firstSlot.fin }]
+    }],
+    singleDay: true
   };
-  console.log(`[PRIORITY] ⏳ Esperando teléfono del paciente — BI-RADS ${birads} en ${jid}`);
-  await sendWhatsAppText(
-    jid,
-    `🔴 *Atención prioritaria (BI-RADS ${birads})*\n` +
-    `Para que nuestra asesora te contacte de inmediato, envíame tu **número celular con indicativo**, por ejemplo: +57 3001234567.`
+
+  const fechaTxt = fmtFechaHumana(firstDay.fecha);
+  const horaTxt  = fmtHoraHumana(firstSlot.inicio);
+
+  return (
+    `Tengo un cupo disponible muy cercano:\n` +
+    `📅 *${fechaTxt}* a las *${horaTxt}*.\n\n` +
+    `¿Deseas tomar esa hora?\n` +
+    `Si no te sirve, te comento que por ahora es la única disponible para ese día.`
   );
 }
 
 
-// Bloquear chat, avisar paciente y notificar al staff
-// Escalamiento de prioridad BI-RADS 4/5: notifica staff y apaga IA 60 min
-// Escala caso BI-RADS 4/5 a staff (Isabel/Deivis) con distribución 3:1,
-// envía acuse al paciente y apaga la IA por 60 minutos.
 // Requiere: getSession, sendWhatsAppText, DateTime, ZONE, panelState, contactNames.
 async function triggerPriorityEscalation(jid, opts = {}) {
   const {
@@ -803,95 +677,92 @@ async function triggerPriorityEscalation(jid, opts = {}) {
   console.log(`[PRIORITY] 🧭 Ruta: ${route.name} | lockUntil=${lockUntil}`);
 }
 
-function getContactLabel(jid) {
-  return contactNames.get(jid) || jid.replace('@s.whatsapp.net','');
-}
-
-function scheduleUnmuteChat(jid, minutes = PRIORITY_LOCK_MINUTES) {
-  try {
-    if (priorityMuteTimers.has(jid)) {
-      clearTimeout(priorityMuteTimers.get(jid));
-    }
-    const t = setTimeout(() => {
-      panelState.aiDisabledChats.delete(jid);
-      const s = sessions.get(jid);
-      if (s?.priority) s.priority.active = false;
-      console.log(`[PRIORITY] 🔓 Rehabilitado chat ${jid} tras ${minutes} min`);
-      priorityMuteTimers.delete(jid);
-    }, minutes * 60 * 1000);
-    priorityMuteTimers.set(jid, t);
-  } catch (e) {
-    console.error('[PRIORITY] scheduleUnmuteChat error:', e);
-  }
-}
-
-
-function isCoomeva(v='') {
-  const s = norm(v);
-  // tolera “coomeva/comeva”
-  return s.includes('coomeva') || s.includes('comeva');
-}
-function isPreferente(v='') {
-  const s = norm(v);
-  return s.includes('preferente') || s.includes('preferencial');
-}
-
 
 function ventanasPorDia(date, tipo = '') {
-  const dow = date.weekday; // 1=Lun ... 7=sDom
+  const dow = date.weekday; // 1=Lun ... 7=Dom
   const t = norm(tipo);
   const v = [];
   const H = (h, m = 0) => date.set({ hour: h, minute: m, second: 0, millisecond: 0 });
   const push = (start, end) => { if (end > start) v.push({ start, end }); };
 
-  if (dow === 2) return v; // Martes sin consulta
+  // Martes sin consulta
+  if (dow === 2) return v;
 
-  // Lunes
+  // Lunes (solo presencial)
   if (dow === 1) {
-    if (t.includes('control virtual')) return v;        // lunes solo presencial
-    push(H(8,0), H(11,30));
-    push(H(14,0), H(17,30));
+    if (t.includes('control virtual')) return v; // lunes solo presencial
+    push(H(8, 0), H(11, 30));
+    push(H(14, 0), H(17, 30));
     return v;
   }
 
-  // Miércoles y Jueves → 14:00 a 17:30 (antes lo tenías hasta 16:30)
+  // Miércoles y Jueves → 14:00 a 16:30 (presencial)
   if (dow === 3 || dow === 4) {
     if (t.includes('control virtual')) return v;
-    push(H(14,0), H(17,30));
+    push(H(14, 0), H(16, 30));
     return v;
   }
 
   // Viernes: presencial en la mañana / virtual en la tarde
   if (dow === 5) {
     if (t.includes('control virtual')) {
-      push(H(14,0), H(17,30));
+      // Controles virtuales solo en la tarde: 14:00–16:30
+      push(H(14, 0), H(16, 30));
     } else {
-      push(H(8,0), H(11,30));
+      // Presenciales en la mañana
+      push(H(8, 0), H(11, 30));
     }
     return v;
   }
 
-  // Sáb / Dom sin consulta
+  // Sábado / Domingo: sin consulta (por ahora)
   return v;
 }
 
+
 function generarSlots(dateISO, tipo, maxSlots = 100) {
   const date = DateTime.fromISO(dateISO, { zone: ZONE });
-  const ventanas = ventanasPorDia(date, tipo);
-  const dur = duracionPorTipo(tipo);
+  const ventanas = ventanasPorDia(date, tipo);   // ventanas de trabajo del doctor ese día
+  const dur = duracionPorTipo(tipo);             // ej: 20 para "Primera vez", 15 para "Control presencial"
+  const STEP = 5;                                // resolucion de 5 minutos
+
   const slots = [];
+
   for (const win of ventanas) {
+    if (!win || !win.start || !win.end) continue;
+
     let cursor = win.start;
-    while (cursor.plus({ minutes: dur }) <= win.end) {
-      const fin = cursor.plus({ minutes: dur });
-      slots.push({ inicio: cursor.toISO({ suppressMilliseconds: true }), fin: fin.toISO({ suppressMilliseconds: true }) });
-      cursor = fin;
-      if (slots.length >= maxSlots) break;
+
+    // Alinear el cursor a múltiplos de 5 min (por si la ventana comienza en x:02 o algo raro)
+    const m = cursor.minute % STEP;
+    if (m !== 0) {
+      cursor = cursor.plus({ minutes: STEP - m });
     }
+
+    while (slots.length < maxSlots) {
+      const fin = cursor.plus({ minutes: dur });
+
+      // Permite un pequeeeño overhang si quieres (ej: terminar 16:05 cuando la ventana acaba 16:00)
+      // Si prefieres estricto dentro de la ventana, usa: if (fin > win.end) break;
+      if (fin > win.end.plus({ minutes: STEP })) {
+        break;
+      }
+
+      slots.push({
+        inicio: cursor.toISO({ suppressMilliseconds: true }),
+        fin: fin.toISO({ suppressMilliseconds: true })
+      });
+
+      // Avanzamos el cursor 5 minutos, para poder tener 8:00, 8:20, 8:35, 8:50, etc.
+      cursor = cursor.plus({ minutes: STEP });
+    }
+
     if (slots.length >= maxSlots) break;
   }
+
   return { dur, ventanas, slots };
 }
+
 
 function overlaps(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && bStart < aEnd;
@@ -938,20 +809,21 @@ function firstAllowedStart(now = DateTime.now().setZone(ZONE)) {
    };
 }
 
-function clampDiasToMonth(_desdeISO, diasSolicitados) {
-   // No recortar: respeta lo que pida el usuario/bot
-   return diasSolicitados;
- }
-
-
 function filtrarSlotsLibres(slots, busy) {
-  if (!busy.length) return slots;
+  // Blindaje fuerte
+  if (!Array.isArray(slots) || !slots.length) return [];
+
+  const busyArr = Array.isArray(busy) ? busy : [];
+  if (!busyArr.length) return slots;
+
   return slots.filter(s => {
     const s1 = DateTime.fromISO(s.inicio, { zone: ZONE });
     const s2 = DateTime.fromISO(s.fin,    { zone: ZONE });
-    return !busy.some(b => overlaps(s1, s2, b.start, b.end));
+
+    return !busyArr.some(b => overlaps(s1, s2, b.start, b.end));
   });
 }
+
 function slotDentroDeVentanas(startISO, endISO, tipo) {
   const s = DateTime.fromISO(startISO, { zone: ZONE });
   const e = DateTime.fromISO(endISO, { zone: ZONE });
@@ -1006,11 +878,18 @@ function renderReminderTemplate(tpl, ctx = {}) {
     .replace(/\{(nombre|fecha|hora|fecha_hora|jid|tipo)\}/gi, (_, k) => map[k.toLowerCase()] ?? '');
 }
 
-
-// ====== Disponibilidad (rango) ======
 async function disponibilidadPorDias({ tipo, desdeISO, dias = 30, maxSlotsPorDia = 100 }) {
   console.time(`disponibilidad:${desdeISO}:${dias}:${tipo}`);
-  const start = DateTime.fromISO(desdeISO, { zone: ZONE });
+
+  let start = DateTime.fromISO(desdeISO, { zone: ZONE });
+
+  // Clamp por si llaman con fecha anterior a 1 de diciembre para virtual
+  if (/virtual/i.test(tipo)) {
+    const minVirtual = DateTime.fromISO(MIN_VIRTUAL_CONTROL_DATE_ISO, { zone: ZONE }).startOf('day');
+    if (minVirtual.isValid && start < minVirtual) {
+      start = minVirtual;
+    }
+  }
 
   const diasLista = [];
   for (let i = 0; i < dias; i++) diasLista.push(start.plus({ days: i }));
@@ -1024,21 +903,28 @@ async function disponibilidadPorDias({ tipo, desdeISO, dias = 30, maxSlotsPorDia
       const d = diasLista[idx++];
 
       try {
+        // 🔥 CONTROLES VIRTUALES: solo viernes (weekday 5)
+        if (/virtual/i.test(tipo) && d.weekday !== 5) {
+          continue;
+        }
+
         const dISO = d.toISODate();
         const { dur, ventanas, slots } = generarSlots(dISO, tipo, 2000);
         if (!ventanas.length) continue;
 
         console.time(`fb:${dISO}`);
-        const busy = await consultarBusy(ventanas);   // consulta día completo
+        const busy = await consultarBusy(ventanas);
         console.timeEnd(`fb:${dISO}`);
 
-        const libres = filtrarSlotsLibres(slots, busy);  // ← sin slice
+        const libres = filtrarSlotsLibres(slots, busy);
         if (libres.length) {
           out.push({
             fecha: dISO,
             duracion_min: dur,
             total: libres.length,
-            ejemplos: libres.slice(0, 8).map(s => DateTime.fromISO(s.inicio, { zone: ZONE }).toFormat('HH:mm')), // solo preview
+            ejemplos: libres
+              .slice(0, 8)
+              .map(s => DateTime.fromISO(s.inicio, { zone: ZONE }).toFormat('HH:mm')),
             slots: libres
           });
         }
@@ -1100,59 +986,7 @@ function extractHour(text) {
   return null;
 }
 
-async function showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom) {
-  const pol   = _monthPolicyFrom(_firstAllowedStart(now).toISODate());
-  const desde = pol.start.toISODate();
-  const tipo  = session.tipoActual || 'Primera vez';
 
-  const dias  = DEFAULT_RANGE_DAYS; // ya no meses completos
-
-  let diasDisp = await disponibilidadPorDias({ tipo, desdeISO: desde, dias });
-
-  // Dedup por fecha y hora
-  const byDate = new Map();
-  for (const d of diasDisp) {
-    const k = d.fecha;
-    const prev = byDate.get(k);
-    const merged = (prev?.slots || []).concat(d.slots || []);
-    const seen = new Set();
-    const slots = merged
-      .filter(s => {
-        const key = String(s.inicio);
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .sort((a,b) => String(a.inicio).localeCompare(String(b.inicio)));
-    byDate.set(k, { fecha: k, slots });
-  }
-  diasDisp = [...byDate.values()]
-    .filter(d => (d.slots || []).length > 0)
-    .sort((a,b) => a.fecha.localeCompare(b.fecha));
-
-  if (!diasDisp.length) {
-    const alt = tipo.toLowerCase().includes('virtual') ? 'Control presencial' : 'Control virtual';
-    return `No encontré cupos en los próximos ${dias} días para **${tipo}**. ¿Probamos con **${alt}** o una fecha específica (ej. “3 de enero a las 8:20”)?`;
-  }
-
-  // Solo primeros N días y hasta M horas por día
-  const preview = diasDisp.slice(0, MAX_DAYS_TO_SHOW);
-  const lineas = preview.map(d => {
-    const fecha = fmtFechaHumana(d.fecha);
-    const horas = (d.slots || [])
-      .slice(0, MAX_SLOTS_PER_DAY)
-      .map(s => fmtHoraHumana(s.inicio)).join(', ');
-    const extra = (d.slots || []).length > MAX_SLOTS_PER_DAY ? '…' : '';
-    return `- ${fecha}: ${horas}${extra}`;
-  }).join('\n');
-
-  const restantes = Math.max(0, diasDisp.length - preview.length);
-  const cola = restantes
-    ? `\n\n(Puedo mostrar más días si quieres, o dime una fecha/hora exacta).`
-    : '';
-
-  return `Disponibilidad para **${tipo}** (primeros ${preview.length} días con cupos):\n${lineas}${cola}`;
-}
 
 
 
@@ -1506,28 +1340,7 @@ function detectarBirads(raw = '') {
 }
 function isPriorityBirads(b) { if (!b) return false; const u = String(b).toUpperCase(); return u.startsWith('4') || u.startsWith('5'); }
 
-function parsePatientData(text = '') {
-  const out = {}; const s = String(text || '');
-  const get = (re, i = 1) => { const m = s.match(re); return m ? m[i].trim() : undefined; };
-  out.nombre   = get(/(?:^|\b)nombre\s*[:\-]?\s*([^\n,;]+)/i);
-  out.apellido = get(/(?:^|\b)apellido\s*[:\-]?\s*([^\n,;]+)/i);
-  out.cedula   = get(/(?:c[eé]dula|cedula|cc|documento)\s*[:\-]?\s*([0-9.\-]+)/i);
-  out.correo   = get(/([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i);
-  const phone  = s.match(/(\+?\d[\d\s\-]{7,}\d)/);
-  out.telefono = phone ? phone[1].replace(/[\s\-]/g, '') : undefined;
-  out.direccion= get(/(?:direcci[oó]n|direccion)\s*[:\-]?\s*([^\n]+)/i);
-  const parts = s.split(/[\n,;]+/).map(x => x.trim()).filter(Boolean);
-  if ((!out.nombre || !out.apellido || !out.cedula || !out.correo || !out.telefono || !out.direccion) && parts.length >= 6) {
-    out.nombre = out.nombre || parts[0];
-    out.apellido = out.apellido || parts[1];
-    out.cedula = out.cedula || parts[2];
-    out.correo = out.correo || (parts[3].includes('@') ? parts[3] : out.correo);
-    out.telefono = out.telefono || parts[4].replace(/[\s\-]/g, '');
-    out.direccion = out.direccion || parts.slice(5).join(', ');
-  }
-  return out;
-}
-function missingPatientFields(d = {}) { return ['nombre','apellido','cedula','correo','telefono','direccion'].filter(k => !d[k] || !String(d[k]).trim()); }
+
 // Normaliza "10", "10:0", "10:00" → "10:00"
 function normHHmm(hora) {
   const s = String(hora || '').trim();
@@ -1540,25 +1353,6 @@ function normHHmm(hora) {
 
 
 
-async function resumirPDF(textoPlano, birads) {
-  const prompt = `Resume en 2–3 líneas, en español, los hallazgos clave de este informe de imagen mamaria. Incluye lateralidad si aparece, hallazgos relevantes y recomendación. Si hay BI-RADS, menciónalo como "BI-RADS ${birads || ''}". Evita datos personales.
-
-==== TEXTO ====
-${String(textoPlano || '').slice(0, 12000)}
-==== FIN ====`;
-  try {
-    const c = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: 'Eres un asistente clínico que escribe resúmenes MUY breves y precisos en español (máx 3 líneas).' },
-        { role: 'user', content: prompt }
-      ],
-      temperature: 0.2,
-      max_tokens: 180,
-    });
-    return c.choices[0].message.content.trim();
-  } catch (e) { console.error('⚠️ Error resumiendo PDF:', e); return null; }
-}
 
 // ====== Cancelación ======
 async function cancelEventById(eventId) {
@@ -1566,14 +1360,6 @@ async function cancelEventById(eventId) {
   catch (err) { const code = err?.response?.status || err?.code; return { ok: false, code, err }; }
 }
 
-
-
-// === CANCEL: helpers de búsqueda por fecha/hora (local) ===
-/**
- * Busca un evento alrededor de una hora local dada con tolerancia.
- * - Busca en un rango de ±30 min en Google Calendar
- * - Selecciona el más cercano si está a ≤10 min del objetivo
- */
 async function findEventByLocal({ fechaISO, horaHHmm, toleranceMin = 10 }) {
   const hhmm = normHHmm(horaHHmm);
   if (!fechaISO || !hhmm) return null;
@@ -1633,57 +1419,10 @@ async function findEventByLocal({ fechaISO, horaHHmm, toleranceMin = 10 }) {
   return best;
 }
 
-async function findEventByCedulaAndLocal({ cedula, fechaISO, horaHHmm }) {
-  if (!cedula || !fechaISO || !horaHHmm) return null;
-  const day = DateTime.fromISO(fechaISO, { zone: ZONE }); if (!day.isValid) return null;
-  const fechaTarget = day.toISODate();
-  const targetMinutes = parseHoraToMinutes(horaHHmm); if (targetMinutes == null) return null;
 
-  const resp = await calendar.events.list({
-    calendarId: CALENDAR_ID,
-    timeMin: day.startOf('day').toUTC().toISO(),
-    timeMax: day.endOf('day').toUTC().toISO(),
-    singleEvents: true,
-    orderBy: 'startTime',
-    maxResults: 250,
-    q: cedula,
-  });
-
-  const items = resp.data.items || [];
-  const normCed = String(cedula).replace(/\D/g, '');
-  const byCedula = items.filter(ev => {
-    if (!ev || !ev.description) return false;
-    const desc = ev.description.toLowerCase().normalize('NFD').replace(/\p{Diacritic}/gu, '');
-    const m = /cedula:\s*([0-9.\-]+)/i.exec(desc);
-    const onlyDigits = m?.[1]?.replace(/\D/g, '') || '';
-    return onlyDigits === normCed;
-  });
-
-  for (const ev of byCedula) {
-    const startISO = ev.start?.dateTime; if (!startISO) continue;
-    const startLocal = DateTime.fromISO(startISO, { zone: ZONE }); if (!startLocal.isValid) continue;
-    const sameDate = startLocal.toISODate() === fechaTarget;
-    const evMinutes = startLocal.hour * 60 + startLocal.minute;
-    if (sameDate && evMinutes === targetMinutes) {
-      return { eventId: ev.id, startISO: startLocal.toISO(), endISO: ev.end?.dateTime ? DateTime.fromISO(ev.end.dateTime, { zone: ZONE }).toISO() : null };
-    }
-  }
-  return null;
-}
 
 // ===== LLM outage handling =====
-const LLM_COOLDOWN_MIN = 60; // minutos apagada la IA en ese chat
-
 let _llmSilenceUntilISO = null; // evita spam en consola
-
-function logLLMErrorOnce(e) {
-  const now = DateTime.now().setZone(ZONE);
-  if (_llmSilenceUntilISO && now < DateTime.fromISO(_llmSilenceUntilISO, { zone: ZONE })) return;
-  _llmSilenceUntilISO = now.plus({ minutes: 2 }).toISO();
-  const code = e?.status || e?.code || 'ERR';
-  const msg = (e?.message || '').slice(0, 160).replace(/\s+/g, ' ');
-  console.warn(`[LLM][DOWN] code=${code} msg=${msg}`);
-}
 
 // ====== Reparador / parser de acciones JSON ======
 function repairJSON(raw = '') {
@@ -1697,13 +1436,7 @@ function repairJSON(raw = '') {
 }
 
 // Quita cualquier bloque JSON visible y fences de código antes de enviar al usuario
-function stripActionJSON(text = '') {
-  let s = String(text || '');
-  s = s.replace(/```(?:json)?[\s\S]*?```/gi, '');       // bloque ```json ... ```
-  s = s.replace(/\{[\s\S]*?"action"\s*:[\s\S]*?\}/gi, ''); // objetos con "action":
-  s = s.replace(/\s{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
-  return s;
-}
+
 
 
 function extractActionJSONBlocks(text = '') {
@@ -1741,82 +1474,146 @@ async function maybeHandleAssistantAction(text, session) {
   for (const payload of payloads) {
     const action = norm(payload.action || '');
 
-if (action === 'consultar_disponibilidad') {
-  // REEMPLAZA por este encabezado robusto
-  const userWants = guessTipo(session.lastUserText || '');
-  let tipo = (payload.data?.tipo) || userWants || session.tipoActual || 'Control presencial';
-  session.tipoActual = tipo; // persistimos
+    // ─────────────────────────────────────
+    // CONSULTAR DISPONIBILIDAD (UN DÍA)
+    // ─────────────────────────────────────
+    if (action === 'consultar_disponibilidad') {
+      const userWants = guessTipo(session.lastUserText || '');
+      let tipoRaw = (payload.data?.tipo) || userWants || session.tipoActual || 'Control presencial';
+      const tipo = normalizeTipo(tipoRaw);
+      session.tipoActual = tipo; // persistimos normalizado
 
-  let { fecha } = payload.data || {};
-  if (fecha) fecha = coerceFutureISODate(fecha);
+      let { fecha } = payload.data || {};
+      if (fecha) fecha = coerceFutureISODate(fecha);
 
-  const { dur, ventanas, slots } = generarSlots(fecha, tipo, 60);
-  if (!ventanas.length) { results.push({ ok: true, fecha, tipo, duracion_min: dur, slots: [], note: 'Día sin consulta según reglas' }); continue; }
-  const busy = await consultarBusy(ventanas);
-  const libres = filtrarSlotsLibres(slots, busy);
-  results.push({ ok: true, fecha, tipo, duracion_min: dur, slots: libres });
-  continue;
-}
+      const { dur, ventanas, slots } = generarSlots(fecha, tipo, 60);
+      if (!ventanas.length) {
+        results.push({
+          ok: true,
+          fecha,
+          tipo,
+          duracion_min: dur,
+          slots: [],
+          note: 'Día sin consulta según reglas'
+        });
+        continue;
+      }
+      const busy = await consultarBusy(ventanas);
+      const libres = filtrarSlotsLibres(slots, busy);
+      results.push({ ok: true, fecha, tipo, duracion_min: dur, slots: libres });
+      continue;
+    }
 
-    // DISPONIBILIDAD (rango)
-if (action === 'consultar_disponibilidad_rango') {
-  const userWants = guessTipo(session.lastUserText || '');
-  let tipo = (payload.data?.tipo) || userWants || session.tipoActual || 'Control presencial';
-  session.tipoActual = tipo;
+    // ─────────────────────────────────────
+    // CONSULTAR DISPONIBILIDAD (RANGO)
+    // ─────────────────────────────────────
+    if (action === 'consultar_disponibilidad_rango') {
+      const userWants = guessTipo(session.lastUserText || '');
+      let tipoRaw = (payload.data?.tipo) || userWants || session.tipoActual || 'Control presencial';
+      const tipo = normalizeTipo(tipoRaw);
+      session.tipoActual = tipo;
 
-  let { desde, dias } = payload.data || {};
-  const nowLocal   = DateTime.now().setZone(ZONE);
-  const startRef   = firstAllowedStartSafe(nowLocal);
-  const desdeFixed = desde ? coerceFutureISODateOrToday(desde) : startRef.toISODate();
+      let { desde, dias } = payload.data || {};
+      const nowLocal   = DateTime.now().setZone(ZONE);
+      const startRef   = firstAllowedStartSafe(nowLocal);
+      // 🟣 Clamp especial para control virtual
+      if (/virtual/i.test(tipo)) {
+        const minVirtual = DateTime.fromISO(MIN_VIRTUAL_CONTROL_DATE_ISO, { zone: ZONE }).startOf('day');
+      if (minVirtual.isValid && startRef < minVirtual) {
+        startRef = minVirtual;
+      }
+     }
+      const desdeFixed = desde ? coerceFutureISODateOrToday(desde) : startRef.toISODate();
 
-  // Tope duro: no mirar más de CALENDAR_HORIZON_DAYS
-  const diasCalendar = Math.min(Number(dias || CALENDAR_HORIZON_DAYS), CALENDAR_HORIZON_DAYS);
+         // Si el modelo pidió un "desde" antes del 1 de diciembre, lo subimos igual
+      if (/virtual/i.test(tipo) && desdeFixed < MIN_VIRTUAL_CONTROL_DATE_ISO) {
+        desdeFixed = MIN_VIRTUAL_CONTROL_DATE_ISO;
+      }
 
-  const raw = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: diasCalendar });
+      const diasCalendar = Math.min(Number(dias || CALENDAR_HORIZON_DAYS), CALENDAR_HORIZON_DAYS);
 
-  // Dedupe por fecha, TODAS las horas, ordenar
-  const byDate = new Map();
-  for (const d of raw || []) {
-    const k = d.fecha;
-    const prev = byDate.get(k);
-    const merged = (prev?.slots || []).concat(d.slots || []);
-    const seen = new Set();
-    const slots = merged
-      .filter(s => { const key = String(s.inicio); if (seen.has(key)) return false; seen.add(key); return true; })
-      .sort((a, b) => String(a.inicio).localeCompare(String(b.inicio)));
-    byDate.set(k, { fecha: k, slots });
-  }
-  const ordered = [...byDate.values()]
-    .filter(d => (d.slots || []).length > 0)
-    .sort((a, b) => a.fecha.localeCompare(b.fecha))
-    .slice(0, Number(session.rangeLockHabiles || HABILES_TARGET)); // ← primeros N HÁBILES
+      const raw = await disponibilidadPorDias({ tipo, desdeISO: desdeFixed, dias: diasCalendar });
 
-  results.push({
-    ok: true,
-    tipo,
-    desde: desdeFixed,
-    dias: diasCalendar,
-    total_dias: ordered.length,
-    dias_disponibles: ordered
-  });
-  continue;
-}
+      const byDate = new Map();
+      for (const d of raw || []) {
+        const k = d.fecha;
+        const prev = byDate.get(k);
+        const merged = (prev?.slots || []).concat(d.slots || []);
+        const seen = new Set();
+        const slots = merged
+          .filter(s => { const key = String(s.inicio); if (seen.has(key)) return false; seen.add(key); return true; })
+          .sort((a, b) => String(a.inicio).localeCompare(String(b.inicio)));
+        byDate.set(k, { fecha: k, slots });
+      }
+      const ordered = [...byDate.values()]
+        .filter(d => (d.slots || []).length > 0)
+        .sort((a, b) => a.fecha.localeCompare(b.fecha))
+        .slice(0, Number(session.rangeLockHabiles || HABILES_TARGET));
 
-// CREAR CITA
-if (action === 'crear_cita') {
-  const d = payload.data || {};
-  const s = DateTime.fromISO(d.inicio, { zone: ZONE });
-  const e = DateTime.fromISO(d.fin,   { zone: ZONE });
+      results.push({
+        ok: true,
+        tipo,
+        desde: desdeFixed,
+        dias: diasCalendar,
+        total_dias: ordered.length,
+        dias_disponibles: ordered
+      });
+      continue;
+    }
 
-  // === Tipo efectivo y cache ===
-  const tipoEff = (d.tipo || session.tipoActual || 'Control presencial').trim();
-  session.tipoActual = tipoEff;
+    // ─────────────────────────────────────
+    // CREAR CITA  (AQUÍ ES DONDE PARCHEAMOS)
+    // ─────────────────────────────────────
+    if (action === 'crear_cita') {
+      const d = payload.data || {};
 
-  // === Merge paciente: payload > session (SEÑUELOS NO BLOQUEAN) ===
+      // === Tipo efectivo y cache ===
+      const tipoEff = normalizeTipo(d.tipo || session.tipoActual || 'Control presencial');
+      session.tipoActual = tipoEff;
+
+
+      // === Reparar inicio/fin usando lastOffered + duración, si hace falta ===
+      let inicio = d.inicio || null;
+      let fin    = d.fin    || null;
+
+      // 1) Intentar leer un slot ofrecido previamente
+      let offeredSlot = null;
+      if (session.lastOffered && Array.isArray(session.lastOffered.days) && session.lastOffered.days.length) {
+        const day0 = session.lastOffered.days[0];
+        if (day0 && Array.isArray(day0.slots) && day0.slots.length) {
+          offeredSlot = day0.slots[0]; // en tu flujo normal solo hay 1 slot
+        }
+      }
+
+      // 2) Si el LLM no puso inicio/fin pero nosotros sí tenemos un slot ofrecido, usarlo
+      if ((!inicio || !fin) && offeredSlot) {
+        if (!inicio && offeredSlot.inicio) inicio = offeredSlot.inicio;
+        if (!fin    && offeredSlot.fin)    fin    = offeredSlot.fin;
+      }
+
+      // 3) Si hay inicio pero no fin, lo calculamos con la duración por tipo
+      if (inicio && !fin) {
+        const startDT = DateTime.fromISO(inicio, { zone: ZONE });
+        if (startDT.isValid) {
+          const durMin = duracionPorTipo(tipoEff);
+          fin = startDT.plus({ minutes: durMin }).toISO();
+        }
+      }
+
+      // 4) Construimos DateTime ya reparados
+      const s = inicio ? DateTime.fromISO(inicio, { zone: ZONE }) : DateTime.invalid('no_inicio');
+      const e = fin    ? DateTime.fromISO(fin,    { zone: ZONE }) : DateTime.invalid('no_fin');
+
+      // === Merge paciente: payload > session (SEÑUELOS NO BLOQUEAN) ===
+       // Entidad: pasamos SIEMPRE por normalizeEntidadSalud para evitar cosas tipo "Hola"
+  const entidadFromPayload = normalizeEntidadSalud(d.entidad_salud);
+  const entidadFromSession = normalizeEntidadSalud(session.patient?.entidad_salud);
+  const entidadFinal = entidadFromPayload || entidadFromSession || null;
+
   const pat = {
     nombre:            d.nombre            ?? session.patient?.nombre,
     cedula:            d.cedula            ?? session.patient?.cedula,
-    entidad_salud:     d.entidad_salud     ?? session.patient?.entidad_salud,
+    entidad_salud:     entidadFinal,
     correo:            d.correo            ?? session.patient?.correo,
     celular:           d.celular ?? d.telefono ?? session.patient?.celular,
     direccion:         d.direccion         ?? session.patient?.direccion,
@@ -1828,223 +1625,271 @@ if (action === 'crear_cita') {
     estado_civil:      d.estado_civil      ?? session.patient?.estado_civil,
     plan:              d.plan              ?? session.patient?.plan,
   };
-  session.patient = { ...(session.patient||{}), ...pat };
 
-  // === Bloqueo por prioridad
-  if (session.priority?.active) {
-    results.push({
-      ok: false,
-      error: 'prioridad_activa',
-      message: 'Tu caso es prioritario y un asesor te contactará directamente. No puedo crear la cita por este medio.'
-    });
-    session.lastSystemNote = 'Bloqueado crear_cita por prioridad activa.';
-    continue;
-  }
+  // Actualizamos cache de sesión ya "limpio"
+  session.patient = { ...(session.patient || {}), ...pat };
 
-  // === Validaciones de tiempo
-  if (!s.isValid || !e.isValid || s >= e) {
-    results.push({ ok: false, error: 'fecha_invalida', message: 'Fecha/hora inválida.' });
-    session.lastSystemNote = 'El último intento falló: fecha/hora inválida.';
-    continue;
-  }
-  if (s < now) {
-    results.push({ ok: false, error: 'fecha_pasada', message: 'La hora elegida ya pasó. Elige una fecha futura.' });
-    session.lastSystemNote = 'Falló por fecha pasada.';
-    continue;
-  }
 
- 
+      // === Bloqueo por prioridad
+      if (session.priority?.active) {
+        results.push({
+          ok: false,
+          error: 'prioridad_activa',
+          message: 'Tu caso es prioritario y un asesor te contactará directamente. No puedo crear la cita por este medio.'
+        });
+        session.lastSystemNote = 'Bloqueado crear_cita por prioridad activa.';
+        continue;
+      }
 
-  // === Mínimo absoluto (si aplica)
-  if (typeof MIN_BOOKING_DATE_ISO === 'string' && MIN_BOOKING_DATE_ISO) {
-    const minDay = DateTime.fromISO(MIN_BOOKING_DATE_ISO, { zone: ZONE }).startOf('day');
-    if (minDay.isValid && s < minDay) {
-      results.push({
-        ok:false,
-        error:'antes_minimo',
-        message:`Solo agendamos desde el ${minDay.setLocale('es').toFormat("d 'de' LLLL yyyy")} en adelante.`
+      // === Validaciones de tiempo (ya con posible reparación)
+      if (!s.isValid || !e.isValid || s >= e) {
+        console.log('[CREAR_CITA][ERR fecha_invalida]', {
+          rawInicio: d.inicio,
+          rawFin: d.fin,
+          repairedInicio: inicio,
+          repairedFin: fin,
+          lastOffered: session.lastOffered || null
+        });
+        results.push({ ok: false, error: 'fecha_invalida', message: 'Fecha/hora inválida.' });
+        session.lastSystemNote = 'El último intento falló: fecha/hora inválida.';
+        continue;
+      }
+
+      if (s < now) {
+        results.push({
+          ok: false,
+          error: 'fecha_pasada',
+          message: 'La hora elegida ya pasó. Elige una fecha futura.'
+        });
+        session.lastSystemNote = 'Falló por fecha pasada.';
+        continue;
+      }
+
+      // === Mínimo absoluto (si aplica)
+      if (typeof MIN_BOOKING_DATE_ISO === 'string' && MIN_BOOKING_DATE_ISO) {
+        const minDay = DateTime.fromISO(MIN_BOOKING_DATE_ISO, { zone: ZONE }).startOf('day');
+        if (minDay.isValid && s < minDay) {
+          results.push({
+            ok: false,
+            error: 'antes_minimo',
+            message: `Solo agendamos desde el ${minDay.setLocale('es').toFormat("d 'de' LLLL yyyy")} en adelante.`
+          });
+          session.lastSystemNote = 'Falló por fecha anterior al mínimo.';
+          continue;
+        }
+      }
+
+      // === OBLIGATORIOS REALES
+      const required = ['nombre','cedula','entidad_salud','correo','celular','direccion','ciudad'];
+      const labels = {
+        nombre: 'nombre completo',
+        cedula: 'cédula',
+        entidad_salud: 'entidad de salud (o particular)',
+        correo: 'correo',
+        celular: 'número de celular',
+        direccion: 'dirección',
+        ciudad: 'ciudad',
+      };
+      const missing = required.filter(k => !pat[k] || String(pat[k]).trim() === '');
+      if (missing.length) {
+        const human = missing.map(k => labels[k] || k).join(', ');
+        results.push({
+          ok: false,
+          error: 'faltan_campos',
+          message: `Antes de agendar necesito: ${human}.`
+        });
+        session.lastSystemNote = `Crear_cita bloqueado: faltan ${missing.join(', ')}.`;
+        continue;
+      }
+
+      // === Coomeva Preferente
+      const entidadRaw = String(pat.entidad_salud || '');
+      const planRaw = String(pat.plan || '');
+      if (/coomeva/i.test(entidadRaw) && /preferent/i.test(entidadRaw + ' ' + planRaw)) {
+        results.push({
+          ok: false,
+          error: 'coomeva_preferente',
+          message: 'No podemos agendar con Coomeva Preferente. ¿Deseas agendar como particular?'
+        });
+        session.lastSystemNote = 'Intento con Coomeva Preferente bloqueado.';
+        continue;
+      }
+
+      // === Ventanas válidas
+      if (!slotDentroDeVentanas(s.toISO(), e.toISO(), tipoEff)) {
+        results.push({
+          ok: false,
+          error: 'fuera_horario',
+          message: 'Ese día/horario no es válido según las reglas.'
+        });
+        session.lastSystemNote = 'Falló por fuera de horario.';
+        continue;
+      }
+
+      // === Solapamiento en Calendar
+      const fb = await calendar.freebusy.query({
+        requestBody: {
+          timeMin: s.toUTC().toISO(),
+          timeMax: e.toUTC().toISO(),
+          items: [{ id: CALENDAR_ID }],
+          timeZone: ZONE,
+        },
       });
-      session.lastSystemNote = 'Falló por fecha anterior al mínimo.';
+      const cal = fb.data.calendars?.[CALENDAR_ID];
+      const busy = (cal?.busy || []).map(b => ({
+        start: DateTime.fromISO(b.start, { zone: ZONE }),
+        end:   DateTime.fromISO(b.end,   { zone: ZONE }),
+      }));
+      const solapa = busy.some(b => overlaps(s, e, b.start, b.end));
+      if (solapa) {
+        results.push({
+          ok: false,
+          error: 'slot_ocupado',
+          message: 'Ese horario ya está reservado. Elige otra opción.'
+        });
+        session.lastSystemNote = 'Falló por slot ocupado.';
+        continue;
+      }
+
+      // === Nombre (obligatorio)
+      const displayName = String(pat.nombre).trim();
+
+      // === Insertar evento
+      try {
+        const ins = await calendar.events.insert({
+          calendarId: CALENDAR_ID,
+          requestBody: {
+            summary: `[${tipoEff}] ${displayName} (${pat.entidad_salud || ''})`.trim(),
+            location: 'Clínica Portoazul, piso 7, consultorio 707, Barranquilla',
+            description:
+              `Cédula: ${pat.cedula || ''}\n` +
+              `Entidad: ${pat.entidad_salud || ''}\n` +
+              `Teléfono: ${pat.celular || ''}\n` +
+              `Correo: ${pat.correo || ''}\n` +
+              `Tipo: ${tipoEff}\n` +
+              (pat.fecha_nacimiento ? `Fecha de nacimiento: ${pat.fecha_nacimiento}\n` : '') +
+              (pat.tipo_sangre ? `Tipo de sangre: ${pat.tipo_sangre}\n` : '') +
+              (pat.estado_civil ? `Estado civil: ${pat.estado_civil}\n` : '') +
+              `Dirección: ${pat.direccion || ''}\n` +
+              `Ciudad: ${pat.ciudad || ''}`,
+            start: { dateTime: s.toISO(), timeZone: ZONE },
+            end:   { dateTime: e.toISO(), timeZone: ZONE },
+          },
+        });
+
+        const f = s.setLocale('es');
+        const fechaTxt = f.toFormat("d 'de' LLLL");
+        const horaTxt  = f.toFormat('HH:mm');
+        const confirmText =
+          `Tu cita ha sido agendada exitosamente para el ${fechaTxt} a las ${horaTxt} ` +
+          `en la Clínica Portoazul, piso 7, consultorio 707, en Barranquilla. ` +
+          `Por favor, llega con 15 minutos de anticipación y lleva todos los reportes previos impresos.\n\n` +
+          `Recuerda que está prohibido grabar audio o video durante la consulta sin autorización. ` +
+          `Cualquier inquietud adicional, no dudes en contactarnos.`;
+
+        console.log('✅ Evento creado:', ins.data.id, ins.data.htmlLink || '', {
+          tipo: tipoEff, nombre: displayName, cedula: pat.cedula, cel: pat.celular
+        });
+
+        results.push({
+          ok: true,
+          eventId: ins.data.id,
+          htmlLink: ins.data.htmlLink || null,
+          inicio: s.toISO(),
+          fin: e.toISO(),
+          tipo: tipoEff,
+          confirmText,
+        });
+        session.lastSystemNote = 'La última cita fue creada correctamente en el calendario.';
+      } catch (err) {
+        console.error('❌ Error creando evento:', err?.response?.data || err);
+        results.push({
+          ok: false,
+          error: 'gcal_insert_error',
+          message: 'No se pudo crear la cita en Google Calendar.'
+        });
+        session.lastSystemNote = 'No se pudo crear la cita en Google Calendar.';
+      }
+      continue;
+    }
+
+    // ─────────────────────────────────────
+    // GUARDAR PACIENTE (mock)
+    // ─────────────────────────────────────
+    if (action === 'guardar_paciente') {
+      results.push({ ok: true, saved: true });
+      continue;
+    }
+
+    // ─────────────────────────────────────
+    // CANCELAR CITA
+    // ─────────────────────────────────────
+    if (action === 'cancelar_cita') {
+      const d = payload.data || {};
+      const cedula = (d.cedula || '').trim();
+      console.log('[CANCEL] Cédula recibida (señuelo, no valida):', cedula || '(vacía)');
+
+      const fecha = (d.fecha || '').trim();
+      const hora  = (d.hora  || '').trim();
+
+      if (!fecha || !hora) {
+        console.log('[CANCEL] Falta fecha u hora → pedir datos');
+        results.push({
+          ok:false,
+          error:'falta_fecha_hora',
+          message:'Indícame la fecha (AAAA-MM-DD) y la hora (HH:mm) exactas de tu cita.'
+        });
+        continue;
+      }
+
+      const hhmm = normHHmm(hora);
+      if (!hhmm) {
+        console.log('[CANCEL] Hora inválida (normHHmm falló):', hora);
+        results.push({
+          ok:false,
+          error:'hora_invalida',
+          message:'Formato de hora inválido. Usa 24h, por ejemplo: 08:00 o 14:30.'
+        });
+        continue;
+      }
+
+      console.log(`[CANCEL] Buscando evento por fecha/hora → ${fecha} ${hhmm} (${ZONE}) con tolerancia ±10min`);
+      const found = await findEventByLocal({ fechaISO: fecha, horaHHmm: hhmm, toleranceMin: 10 });
+
+      if (!found) {
+        console.log('[CANCEL][ERR] No se encontró evento con fecha/hora dentro de la tolerancia.');
+        results.push({
+          ok:false,
+          error:'no_encontrada',
+          message:'No encontré una cita exactamente con esos datos.'
+        });
+        continue;
+      }
+
+      console.log('[CANCEL] Cancelando eventId=', found.eventId, 'startLocal=', found.startLocal);
+      const del = await cancelEventById(found.eventId);
+      if (!del.ok) {
+        console.log('[CANCEL][ERR] No se pudo cancelar:', del.code);
+        results.push({
+          ok:false,
+          error:'cancel_error',
+          code:del.code,
+          message:'No se pudo cancelar la cita.'
+        });
+        continue;
+      }
+
+      console.log('[CANCEL] ✅ Cancelada eventId=', found.eventId, 'startLocal=', found.startLocal, 'resumen=', found.summary);
+      results.push({ ok:true, cancelled:true, eventId:found.eventId });
+      session.lastSystemNote = 'Se canceló una cita (ok).';
       continue;
     }
   }
 
-  // === OBLIGATORIOS REALES (incluye NOMBRE)
-  const required = ['nombre','cedula','entidad_salud','correo','celular','direccion','ciudad'];
-  const labels = {
-    nombre: 'nombre completo',
-    cedula: 'cédula',
-    entidad_salud: 'entidad de salud (o particular)',
-    correo: 'correo',
-    celular: 'número de celular',
-    direccion: 'dirección',
-    ciudad: 'ciudad',
-  };
-  const missing = required.filter(k => !pat[k] || String(pat[k]).trim()==='');
-  if (missing.length) {
-    const human = missing.map(k => labels[k] || k).join(', ');
-    results.push({
-      ok:false,
-      error:'faltan_campos',
-      message:`Antes de agendar necesito: ${human}.`
-    });
-    session.lastSystemNote = `Crear_cita bloqueado: faltan ${missing.join(', ')}.`;
-    continue;
-  }
-
-  // === Coomeva Preferente (no atendemos)
-  const entidadRaw = String(pat.entidad_salud||'');
-  const planRaw = String(pat.plan||'');
-  if (/coomeva/i.test(entidadRaw) && /preferent/i.test(entidadRaw + ' ' + planRaw)) {
-    results.push({
-      ok:false,
-      error:'coomeva_preferente',
-      message:'No podemos agendar con Coomeva Preferente. ¿Deseas agendar como particular?'
-    });
-    session.lastSystemNote = 'Intento con Coomeva Preferente bloqueado.';
-    continue;
-  }
-
-  // === Ventanas válidas (lunes/mié/jue/vie, etc.)
-  if (!slotDentroDeVentanas(d.inicio, d.fin, tipoEff)) {
-    results.push({ ok: false, error: 'fuera_horario', message: 'Ese día/horario no es válido según las reglas.' });
-    session.lastSystemNote = 'Falló por fuera de horario.';
-    continue;
-  }
-
-  // === Solapamiento en Calendar
-  const fb = await calendar.freebusy.query({
-    requestBody: {
-      timeMin: s.toUTC().toISO(),
-      timeMax: e.toUTC().toISO(),
-      items: [{ id: CALENDAR_ID }],
-      timeZone: ZONE,
-    },
-  });
-  const cal = fb.data.calendars?.[CALENDAR_ID];
-  const busy = (cal?.busy || []).map(b => ({
-    start: DateTime.fromISO(b.start, { zone: ZONE }),
-    end:   DateTime.fromISO(b.end,   { zone: ZONE }),
-  }));
-  const solapa = busy.some(b => overlaps(s, e, b.start, b.end));
-  if (solapa) {
-    results.push({ ok: false, error: 'slot_ocupado', message: 'Ese horario ya está reservado. Elige otra opción.' });
-    session.lastSystemNote = 'Falló por slot ocupado.';
-    continue;
-  }
-
-  // === Nombre (ahora obligatorio)
-  const displayName = String(pat.nombre).trim();
-
-  // === Insertar evento
-  try {
-    const ins = await calendar.events.insert({
-      calendarId: CALENDAR_ID,
-      requestBody: {
-        summary: `[${tipoEff}] ${displayName} (${pat.entidad_salud || ''})`.trim(),
-        location: 'Clínica Portoazul, piso 7, consultorio 707, Barranquilla',
-        description:
-          `Cédula: ${pat.cedula || ''}\n` +
-          `Entidad: ${pat.entidad_salud || ''}\n` +
-          `Teléfono: ${pat.celular || ''}\n` +
-          `Correo: ${pat.correo || ''}\n` +
-          `Tipo: ${tipoEff}\n` +
-          // —— SEÑUELOS (si llegaron)
-          (pat.fecha_nacimiento ? `Fecha de nacimiento: ${pat.fecha_nacimiento}\n` : '') +
-          (pat.tipo_sangre ? `Tipo de sangre: ${pat.tipo_sangre}\n` : '') +
-          (pat.estado_civil ? `Estado civil: ${pat.estado_civil}\n` : '') +
-          `Dirección: ${pat.direccion || ''}\n` +
-          `Ciudad: ${pat.ciudad || ''}`,
-        start: { dateTime: s.toISO(), timeZone: ZONE },
-        end:   { dateTime: e.toISO(), timeZone: ZONE },
-      },
-    });
-
-    // === Confirmación final
-    const f = s.setLocale('es');
-    const fechaTxt = f.toFormat("d 'de' LLLL");
-    const horaTxt  = f.toFormat('HH:mm');
-    const confirmText =
-      `Tu cita ha sido agendada exitosamente para el ${fechaTxt} a las ${horaTxt} ` +
-      `en la Clínica Portoazul, piso 7, consultorio 707, en Barranquilla. ` +
-      `Por favor, llega con 15 minutos de anticipación y lleva todos los reportes previos impresos.\n\n` +
-      `Recuerda que está prohibido grabar audio o video durante la consulta sin autorización. ` +
-      `Cualquier inquietud adicional, no dudes en contactarnos.`;
-
-    console.log('✅ Evento creado:', ins.data.id, ins.data.htmlLink || '', {
-      tipo: tipoEff, nombre: displayName, cedula: pat.cedula, cel: pat.celular
-    });
-
-    results.push({
-      ok: true,
-      eventId: ins.data.id,
-      htmlLink: ins.data.htmlLink || null,
-      inicio: s.toISO(),
-      fin: e.toISO(),
-      tipo: tipoEff,
-      confirmText,
-    });
-    session.lastSystemNote = 'La última cita fue creada correctamente en el calendario.';
-  } catch (err) {
-    console.error('❌ Error creando evento:', err?.response?.data || err);
-    results.push({ ok: false, error: 'gcal_insert_error', message: 'No se pudo crear la cita en Google Calendar.' });
-    session.lastSystemNote = 'No se pudo crear la cita en Google Calendar.';
-  }
-  continue;
-}
-
-
-    // GUARDAR PACIENTE
-    if (action === 'guardar_paciente') { results.push({ ok: true, saved: true }); continue; }
-
-if (action === 'cancelar_cita') {
-  const d = payload.data || {};
-  const cedula = (d.cedula || '').trim(); // señuelo: lo registramos, no lo usamos para buscar
-  console.log('[CANCEL] Cédula recibida (señuelo, no valida):', cedula || '(vacía)');
-
-  const fecha = (d.fecha || '').trim();
-  const hora  = (d.hora  || '').trim();
-
-  if (!fecha || !hora) {
-    console.log('[CANCEL] Falta fecha u hora → pedir datos');
-    results.push({ ok:false, error:'falta_fecha_hora', message:'Indícame la fecha (AAAA-MM-DD) y la hora (HH:mm) exactas de tu cita.' });
-    continue;
-  }
-
-  const hhmm = normHHmm(hora);
-  if (!hhmm) {
-    console.log('[CANCEL] Hora inválida (normHHmm falló):', hora);
-    results.push({ ok:false, error:'hora_invalida', message:'Formato de hora inválido. Usa 24h, por ejemplo: 08:00 o 14:30.' });
-    continue;
-  }
-
-  console.log(`[CANCEL] Buscando evento por fecha/hora → ${fecha} ${hhmm} (${ZONE}) con tolerancia ±10min`);
-  const found = await findEventByLocal({ fechaISO: fecha, horaHHmm: hhmm, toleranceMin: 10 });
-
-  if (!found) {
-    console.log('[CANCEL][ERR] No se encontró evento con fecha/hora dentro de la tolerancia.');
-    results.push({ ok:false, error:'no_encontrada', message:'No encontré una cita exactamente con esos datos.' });
-    continue;
-  }
-
-  console.log('[CANCEL] Cancelando eventId=', found.eventId, 'startLocal=', found.startLocal);
-  const del = await cancelEventById(found.eventId);
-  if (!del.ok) {
-    console.log('[CANCEL][ERR] No se pudo cancelar:', del.code);
-    results.push({ ok:false, error:'cancel_error', code:del.code, message:'No se pudo cancelar la cita.' });
-    continue;
-  }
-
-  console.log('[CANCEL] ✅ Cancelada eventId=', found.eventId, 'startLocal=', found.startLocal, 'resumen=', found.summary);
-  results.push({ ok:true, cancelled:true, eventId:found.eventId });
-  session.lastSystemNote = 'Se canceló una cita (ok).';
-  continue;
-}
-
-  }
   if (results.length === 1) return { handled: true, makeResponse: results[0] };
   return { handled: true, makeResponse: results };
 }
+
 
 // ============== Handler de mensajes (con CORTE IA temprano) ==============
 async function handleIncomingBaileysMessage(m) {
@@ -2962,62 +2807,185 @@ boot();
 app.get('/panel', (req, res) => res.type('html').send(PANEL_HTML));
 
 // ====== HELPERS: extracción de datos del paciente ======
-function ensurePatient(session){ if(!session.patient) session.patient = {}; return session.patient; }
-
-function extractCedula(s){ const m=(s||'').match(/\b(\d{6,12})\b/); return m?m[1]:null; }
-function extractPhone(s){
-  const clean=(s||'').replace(/\s+/g,'');
-  const m=clean.match(/(\+?57)?3\d{9}/);
-  if(!m) return null;
-  const v=m[0]; 
-  return v.startsWith('+') ? v : (v.startsWith('57')? ('+'+v) : ('+57'+v));
+function cleanBase(str = "") {
+  return String(str || "")
+    .replace(/[🏠📍➡️←↑↓🏢🏘️🛣️🛤️]/g, " ")         // emojis de dirección
+    .replace(/\s+/g, " ")                         // espacios dobles
+    .trim()
+    .toLowerCase();
 }
-function extractEmail(s){ const m=(s||'').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); return m?m[0]:null; }
+
+function isCoomevaPreferente(text) {
+  const t = String(text || '').toLowerCase();
+
+  if (!/coomeva/.test(t)) return false;
+  if (/\bpreferent(e|es)?\b/.test(t)) return true;
+
+  return false;
+}
+
+
+
+function ensurePatient(session){
+  if(!session.patient) session.patient = {};
+  return session.patient;
+}
+
+// CÉDULA
+function extractCedula(s){ 
+  const m=(s||'').match(/\b(\d{6,12})\b/); 
+  return m?m[1]:null; 
+}
+
+// CELULAR (con prefijos +57, 57, 3…)
+function extractPhone(s){
+  const clean=(s||'').replace(/\D+/g,'');
+  const m=clean.match(/(57)?3\d{9}/);
+  if(!m) return null;
+  const v=m[0];
+  return v.startsWith("57") ? ("+"+v) : ("+57"+v);
+}
+
+// EMAIL con corrección de errores comunes
+function extractEmail(s){ 
+  let m=(s||'').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); 
+  if(!m) return null;
+
+  let email = m[0].toLowerCase();
+  email = email.replace(/@gmai\.com/, '@gmail.com')
+               .replace(/@hotmil\.com/, '@hotmail.com')
+               .replace(/@outllok\.com/, '@outlook.com');
+  return email;
+}
+
 
 // AAAA-MM-DD o dd/mm/aaaa
 function extractFechaNacimiento(s){
-  const m1=(s||'').match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  const t = cleanBase(s);
+
+  // 2024-12-20
+  const m1=t.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
   if(m1) return `${m1[1]}-${m1[2]}-${m1[3]}`;
-  const m2=(s||'').match(/\b(\d{2})\/(\d{2})\/(\d{4})\b/);
+
+  // 20/12/2024
+  const m2=t.match(/\b(\d{2})\/(\d{2})\/(\d{4})\b/);
   if(m2) return `${m2[3]}-${m2[2]}-${m2[1]}`;
+
   return null;
 }
+
 
 // A+, A-, B+, B-, AB+, AB-, O+, O-
 function extractBloodType(s){
   const m=(s||'').toUpperCase().match(/\b(AB|A|B|O)\s*([+-])\b/);
-  return m ? (m[1].toUpperCase()+m[2]) : null;
+  return m ? (m[1]+m[2]) : null;
 }
 
-const CIVILES=['soltero','soltera','casado','casada','union libre','unión libre','divorciado','divorciada','viudo','viuda'];
+
+const CIVILES=[
+  'soltero','soltera','casado','casada',
+  'union libre','unión libre',
+  'divorciado','divorciada','viudo','viuda'
+];
+
 function extractEstadoCivil(s){
-  const low=(s||'').toLowerCase();
+  const low=cleanBase(s);
   const f=CIVILES.find(x=>low.includes(x));
   return f ? (f[0].toUpperCase()+f.slice(1)) : null;
 }
 
+
 // heurísticas rápidas (opcional)
 function extractDireccion(s){
-  const m=(s||'').match(/\b(cr[ae]\.?|cra\.?|carrera|cll\.?|calle|av\.?|avenida|dg\.?|diagonal|tv\.?|transversal)\b[\s\S]{0,40}/i);
-  return m? m[0].trim() : null;
-}
-function extractCiudad(s){
-  const m=(s||'').match(/\b(barranquilla|bogotá|bogota|medell[ií]n|cali|soledad|cartagena|santa marta|valledupar|bucaramanga)\b/i);
-  return m ? (m[0][0].toUpperCase()+m[0].slice(1)) : null;
-}
+  let t = cleanBase(s);
 
-const ENTIDADES = ['Sudamericana','Colsanitas','Medplus','Bolívar','Bolivar','Allianz','Colmédica','Colmedica','Coomeva','Particular'];
-function extractEntidadSalud(s){
-  for (const e of ENTIDADES){
-    if (new RegExp(e,'i').test(s||'')) return e.replace('í','i');
-  }
+  // normalizar abreviaciones
+  t = t.replace(/\b(carr?e?ra?|krr|kr|crr|crra|cra|cr)\b/g, "cra");
+  t = t.replace(/\b(calle|cll|cl)\b/g, "cl");
+  t = t.replace(/\b(avenida|av)\b/g, "av");
+  t = t.replace(/\b(diagonal|dg)\b/g, "dg");
+  t = t.replace(/\b(transversal|tv)\b/g, "tv");
+
+  // convertir # raro
+  t = t.replace(/#/g, " # ");
+
+  // separar letras y números pegados
+  t = t.replace(/([a-z]+)(\d)/g, "$1 $2");
+  t = t.replace(/(\d)([a-z]+)/g, "$1 $2");
+
+  // patrón típico de dirección
+  const dir = t.match(/\b(cra|cl|av|dg|tv)\b[\s\S]{0,50}/i);
+  if (dir) return dir[0].trim();
+
+  // fallback con numeral
+  const m2 = s.match(/[^\n]{0,40}#\s*\d{1,4}[-–]\d{1,5}/);
+  if (m2) return m2[0].trim();
+
   return null;
 }
+
+
+function extractCiudad(s){
+  const cities = [
+    "barranquilla","bogota","bogotá","medellin","medellín",
+    "cali","soledad","cartagena","santa marta","valledupar",
+    "bucaramanga","envigado","itaguí","sabaneta"
+  ];
+  const t = cleanBase(s);
+  const c = cities.find(ci => t.includes(ci));
+  return c ? c.charAt(0).toUpperCase() + c.slice(1) : null;
+}
+
+const ENTIDADES_CANON = [
+  'Sudamericana',
+  'Colsanitas',
+  'Medplus',
+  'Bolivar',
+  'Allianz',
+  'Colmedica',
+  'Coomeva',
+  'Particular',
+];
+
+function normalizeEntidadSalud(raw) {
+  const txt = String(raw || '').toLowerCase();
+
+  if (!txt.trim()) return null;
+
+  // Sudamericana
+  if (/suda\s*americana|sudamericana/.test(txt)) return 'Sudamericana';
+
+  // Colsanitas
+  if (/col\s*sanitas|colsanitas/.test(txt)) return 'Colsanitas';
+
+  // Medplus
+  if (/med\s*plus|medplus/.test(txt)) return 'Medplus';
+
+  // Bolívar / Bolivar
+  if (/bol[ií]var|bolivar/.test(txt)) return 'Bolivar';
+
+  // Allianz
+  if (/allianz/.test(txt)) return 'Allianz';
+
+  // Colmédica / Colmedica
+  if (/colm[eé]dica|colmedica/.test(txt)) return 'Colmedica';
+
+  // Coomeva (cualquier plan, el plan lo vemos aparte)
+  if (/coomeva/.test(txt)) return 'Coomeva';
+
+  // Particular
+  if (/particular|pago\s*particular/.test(txt)) return 'Particular';
+
+  // Si no coincide con nada conocido → NO es entidad válida
+  return null;
+}
+
 
 // va “aspirando” datos desde cualquier mensaje del paciente
 function collectPatientFields(session, text){
   const p = ensurePatient(session);
   const t = text || '';
+
   p.nombre            = p.nombre            || null; // nombre se suele pedir explícitamente
   p.cedula            = p.cedula            || extractCedula(t);
   p.celular           = p.celular           || extractPhone(t);
@@ -3027,7 +2995,13 @@ function collectPatientFields(session, text){
   p.estado_civil      = p.estado_civil      || extractEstadoCivil(t);
   p.direccion         = p.direccion         || extractDireccion(t);
   p.ciudad            = p.ciudad            || extractCiudad(t);
-  p.entidad_salud     = p.entidad_salud     || extractEntidadSalud(t);
+
+  // 🔴 ENTIDAD: solo aceptamos algo si pasa por normalizeEntidadSalud
+  const candEntidad = normalizeEntidadSalud(t);
+  if (!p.entidad_salud && candEntidad) {
+    p.entidad_salud = candEntidad;
+  }
+
   return p;
 }
 
@@ -3044,6 +3018,86 @@ function missingForTipo(session, tipo){
   const p = ensurePatient(session);
   return requiredForTipo(tipo).filter(k => !p[k]);
 }
+
+function pushKnownPatientNote(session) {
+  const p = ensurePatient(session);
+  const partes = [];
+
+  if (session.tipoActual) {
+    partes.push(`Motivo de consulta actual: "${session.tipoActual}". No vuelvas a preguntar por el motivo salvo que la paciente diga explícitamente que lo quiere cambiar.`);
+  }
+
+  if (p.nombre) {
+    partes.push(`Nombre completo ya registrado: ${p.nombre}. No vuelvas a pedir el nombre.`);
+  }
+  if (p.cedula) {
+    partes.push(`Cédula ya registrada: ${p.cedula}. No vuelvas a pedirla.`);
+  }
+  if (p.entidad_salud) {
+    partes.push(`Entidad de salud ya registrada: ${p.entidad_salud}. No vuelvas a preguntar por EPS/seguro a menos que la paciente diga que quiere cambiarla.`);
+  }
+  if (p.correo) {
+    partes.push(`Correo ya registrado: ${p.correo}. No vuelvas a pedirlo.`);
+  }
+  if (p.celular) {
+    partes.push(`Celular ya registrado: ${p.celular}. No vuelvas a pedirlo.`);
+  }
+  if (p.direccion) {
+    partes.push(`Dirección ya registrada: ${p.direccion}. No vuelvas a pedirla.`);
+  }
+  if (p.ciudad) {
+    partes.push(`Ciudad ya registrada: ${p.ciudad}. No vuelvas a pedirla.`);
+  }
+
+  if (!partes.length) return;
+
+  session.history.push({
+    role: 'system',
+    content:
+      'IMPORTANTE (memoria de datos del paciente): ' +
+      partes.join(' ') +
+      ' Usa estos datos como verdad actual. Si necesitas repetirlos, hazlo a partir de esta nota, pero no vuelvas a pedirlos como si no los tuvieras.'
+  });
+}
+
+function needEntidadBeforeDispon(session) {
+  const p = ensurePatient(session);
+  return !p.entidad_salud;
+}
+
+function normalizeTipo(tipo) {
+  const s = String(tipo || '').toLowerCase();
+
+  if (!s) return 'Control presencial';
+
+  if (s.includes('virtual')) {
+    // Cualquier cosa con "virtual" lo tratamos como control virtual
+    return 'Control virtual';
+  }
+  if (s.includes('primera')) {
+    return 'Primera vez';
+  }
+  if (s.includes('biopsia')) {
+    return 'Biopsia guiada por ecografía';
+  }
+
+  // Todo lo demás lo tratamos como control presencial
+  return 'Control presencial';
+}
+
+function replyAskEntidad(res, session) {
+  const reply =
+    'Antes de revisar la disponibilidad de citas, necesito que me indiques ' +
+    'con qué entidad de salud estás afiliado (por ejemplo, Colsanitas, Sura, Coomeva, MedPlus, etc.) ' +
+    'o si prefieres atenderte como *particular*.';
+
+  session.history.push({ role: 'assistant', content: reply });
+  capHistory(session);
+  touchSession(session);
+  res.json({ reply, makeResponse: null });
+  return true; // para poder hacer "if (replyAskEntidad(...)) return;"
+}
+
 
 // ===== CONFIG opcional por ENV =====
 const LLM_DOWN_MINUTES   = Number(process.env.LLM_DOWN_MINUTES || 45);
@@ -3121,20 +3175,50 @@ async function handleLLMFailureAndDisableChat(jid, err){
 
 // ============== /chat (lógica IA por sesión) ==============
 app.post('/chat', async (req, res) => {
-  
-  const from = normJid(String(req.body.from || 'anon'));
+  const from    = normJid(String(req.body.from || 'anon'));
   const userMsg = String(req.body.message || '').trim();
 
   // 1) OBTÉN SESIÓN Y NOW ANTES DE USARLA EN CUALQUIER BLOQUE
   const session = getSession(from);
-  const now = DateTime.now().setZone(ZONE);
+  const now     = DateTime.now().setZone(ZONE);
+
+  // Aseguramos que exista el objeto patient una sola vez
+  ensurePatient(session); // <- importante para no estar inventándolo en cada lado
+
+  
+    // ⚠️ RECHAZO DE LA HORA OFRECIDA (cuando ya mostramos 1 día/1 hora)
+  if (session.lastOffered && session.lastOffered.singleDay) {
+    const txt = userMsg.toLowerCase();
+    const rechazo = /\b(no quiero\b|no me sirve|no puedo|no deseo|no gracias|no la quiero|no lo quiero|no esa\b|esa no\b|otra hora|otro horario|muy tarde|muy temprano|no me queda bien)\b/i;
+ // i = case-insensitive, x = permite espacios en el regex
+
+    if (rechazo.test(txt)) {
+      // 🔴 Limpiamos la oferta para que no vuelva a insistir
+      session.lastOffered = null;
+
+      const reply =
+        'Entiendo perfectamente.\n\n' +
+        'Por ahora no tengo más horarios disponibles aparte de la hora que te ofrecí. ' +
+        'Si en otro momento deseas buscar un nuevo cupo, puedes escribirme de nuevo.';
+
+      session.history.push({ role: 'assistant', content: reply });
+      capHistory(session);
+      touchSession(session);
+      return res.json({ reply, makeResponse: null });
+    }
+  }
+
+
 
   // 2) DESBLOQUEO DE PRIORIDAD VENCIDA (usa session ya definida)
   if (session.priority?.active && now >= DateTime.fromISO(session.priority.lockUntilISO)) {
+    console.log(`[PRIORITY] Expiró lock en ${from}, desbloqueando`);
     session.priority = null;
+    panelState.aiDisabledChats.delete(from);
   }
-  if (session.priority?.active && session.priority.status === 'submitted') {
-    return res.json({ reply: PRIORITY_LOCK_MESSAGE });
+  if (session.priority?.active) {
+    console.log(`[PRIORITY] Chat bloqueado ${from} — se devuelve mensaje fijo`);
+    return res.json({ reply: 'Atención prioritaria. Un asesor te contactará en breve.' });
   }
 
   // 3) DESBLOQUEO DE “IA APAGADA POR LLM” (antes de chequear IA OFF para poder reactivar)
@@ -3152,16 +3236,16 @@ app.post('/chat', async (req, res) => {
     return res.json({ reply: '' });
   }
 
-  // 5) RESET DURO
+  // 5) RESET DURO (lo dejamos una sola vez, no duplicado)
   if (userMsg === '__RESET__') {
     sessions.delete(from);
     return res.json({ ok: true, reset: true });
   }
 
   // ─────────────────────────────────────────────────────────
-  // Fallbacks locales por si NO pegaste los helpers globales:
+  // Helpers locales por si NO pegaste los helpers globales:
   // firstAllowedStart / monthPolicyFrom y constante MONTH_CUTOFF_DAY
-  const _MONTH_CUTOFF_DAY = (typeof MONTH_CUTOFF_DAY === 'number' ? MONTH_CUTOFF_DAY : 30);
+  const cutoffDay = (typeof MONTH_CUTOFF_DAY === 'number' ? MONTH_CUTOFF_DAY : 24);
 
   const _firstAllowedStart = (typeof firstAllowedStart === 'function')
     ? firstAllowedStart
@@ -3181,34 +3265,13 @@ app.post('/chat', async (req, res) => {
         if (start < minStart) start = minStart;
 
         const endOfMonth     = start.endOf('month').startOf('day');
-        const blocked        = start.day >= _MONTH_CUTOFF_DAY; // 24 o más
+        const blocked        = start.day >= cutoffDay; // usamos cutoffDay seguro
         const nextMonthStart = start.plus({ months: 1 }).startOf('month');
         const diasMax        = Math.max(0, Math.floor(endOfMonth.diff(start, 'days').days) + 1);
 
         return { start, endOfMonth, blocked, nextMonthStart, diasMax };
       };
   // ─────────────────────────────────────────────────────────
-
-  // Desbloqueo de prioridad vencida
-// Desbloqueo de prioridad vencida
-if (session.priority?.active && now >= DateTime.fromISO(session.priority.lockUntilISO)) {
-  console.log(`[PRIORITY] Expiró lock en ${from}, desbloqueando`);
-  session.priority = null;
-  panelState.aiDisabledChats.delete(from);
-}
-
-if (session.priority?.active) {
-  console.log(`[PRIORITY] Chat bloqueado ${from} — se devuelve mensaje fijo`);
-  return res.json({ reply: 'Atención prioritaria. Un asesor te contactará en breve.' });
-}
-
-
-
-  // Reset duro de sesión
-  if (userMsg === '__RESET__') {
-    sessions.delete(from);
-    return res.json({ ok: true, reset: true });
-  }
 
   // -------- Helpers locales --------
   const stripActionBlocks = (s) =>
@@ -3221,15 +3284,37 @@ if (session.priority?.active) {
     /\b(cita|turno)\b[\s\S]{0,50}\b(agendada|confirmada|reservada)/i.test(s || '');
 
   // Detecta tipo explícito por texto del usuario (dentro de /chat para evitar “no definido”)
-  function guessTipo(text = '') {
-    const s = norm(text);
-    if (!s) return null;
-    if (/(biops)/.test(s)) return 'Biopsia guiada por ecografía';
-    if (/(virtual|en\s*linea|en\s*l[ií]nea|online)/.test(s)) return 'Control virtual';
-    if (/(primera\s*vez|primer[ao]\s*consulta|nueva\s*(cita|consulta))/i.test(s)) return 'Primera vez';
-    if (/\bcontrol\b/.test(s) && !/virtual/.test(s)) return 'Control presencial';
-    return null;
+function guessTipo(text = '') {
+  const s = norm(text);
+  if (!s) return null;
+
+  // Biopsia
+  if (/(biops)/.test(s)) {
+    return 'Biopsia guiada por ecografía';
   }
+
+  // Control de resultados / virtual
+  if (/control\s+de\s+resultados?/.test(s)) {
+    return 'Control virtual';
+  }
+  if (/(virtual|en\s*linea|en\s*l[ií]nea|online)/.test(s)) {
+    return 'Control virtual';
+  }
+
+  // Primera vez
+  if (/(primera\s*vez|primer[ao]\s*consulta|nueva\s*(cita|consulta))/i.test(s)) {
+    return 'Primera vez';
+  }
+
+  // Control presencial
+  if (/\bcontrol\b/.test(s) && !/virtual/.test(s) && !/resultado/.test(s)) {
+    return 'Control presencial';
+  }
+
+  return null;
+}
+
+
 
   // ===== Instrucciones de sistema =====
   const todayNote =
@@ -3237,15 +3322,22 @@ if (session.priority?.active) {
     `Reglas: Martes sin consulta; virtual solo viernes tarde; no agendar fechas pasadas.`;
 
   const policyNote =
-    'Usa “**Disponibilidad de citas**” (no “Horarios disponibles”). ' +
-    'Preguntar por estudios recientes está bien, pero evita bucles. ' +
-    '⚠️ **No guardes pacientes** por ahora: NO digas “voy a guardar/registrar tus datos” y NO ejecutes acciones de guardado. ' +
-    'No muestres JSON ni bloques de código al paciente.' +
-    '***Las cancelaciones/reprogramaciones no se hacen por chat: remite siempre a Deivis.***';
+  'Usa “**Disponibilidad de citas**” (no “Horarios disponibles”). ' +
+  'Preguntar por estudios recientes está bien, pero evita bucles. ' +
+  '⚠️ **No guardes pacientes** por ahora: NO digas “voy a guardar/registrar tus datos” y NO ejecutes acciones de guardado. ' +
+  'No muestres JSON ni bloques de código al paciente. ' +
+  'NO ofrezcas al paciente elegir rangos de fechas ni preguntes "¿qué día prefieres o consulto un rango de fechas?". ' +
+  'Cuando hables de disponibilidad, di que vas a revisar y el sistema te devolverá el *primer cupo disponible más cercano* (un solo día y una sola hora). ' +
+  'No inventes reglas de agenda fuera de las instrucciones del sistema. ';
 
-  const epsNote =
-    'Si la entidad es **Coomeva** y el plan es **Preferente**, NO se atiende ni se agenda. ' +
-    'Si dicen Coomeva sin plan, pregunta explícitamente por el plan.';
+const epsNote =
+  'Si la entidad es **Coomeva** y el plan es **Preferente** (incluye nombres como "oro plus", "gold", "VIP"), ' +
+  'el sistema NO debe agendar ni ofrecer cita. ' +
+  'No prometas atención futura con ese plan. ' +
+  'El backend enviará un mensaje fijo explicando que NO se atiende Coomeva Preferente y dará el número de contacto para más información. ' +
+  'Tú no agregues textos contradictorios ni sugieras que sí se puede agendar con ese plan.';
+
+
 
   const actionNote =
     'Para ejecutar acciones usa SIEMPRE un bloque: ' +
@@ -3253,67 +3345,125 @@ if (session.priority?.active) {
     'y además responde con texto natural para el paciente. Yo oculto el bloque. ' +
     'No confirmes citas en el texto visible hasta que el sistema te devuelva confirmación.';
 
-  // Reglas duras de datos para "Primera vez"
-// Reglas de datos para "Primera vez" (permisivas)
-const firstTimeNote =
-  'Si el motivo es "Primera vez": pide TODOS los datos en UN SOLO mensaje (usa la plantilla), ' +
-  'pero **sí puedes consultar disponibilidad** aunque falte alguno. ' +
-  'Solo BLOQUEA al **crear_cita** si falta un campo del núcleo: ' +
+  // Reglas de datos para "Primera vez" (permisivas)
+ const firstTimeNote =
+  'Si el motivo es "Primera vez": pide TODOS los datos en UN SOLO mensaje (usa la plantilla) ' +
+  '(nombre completo, cédula, entidad_salud, correo, celular, dirección, ciudad, fecha de nacimiento, tipo de sangre, estado civil, antecedentes de estudios). ' +
+  'En tus mensajes al paciente NO digas que algún dato es opcional ni uses frases como "si deseas", "si quieres puedes incluir", "si es posible". ' +
+  'Puedes consultar disponibilidad aunque falte alguno de esos campos, pero SOLO bloquea al **crear_cita** si falta un campo del núcleo: ' +
   'nombre completo, cédula, entidad_salud, correo, celular, dirección y ciudad. ' +
-  'Los campos “señuelo” (fecha de nacimiento, tipo de sangre, estado civil) no bloquean.';
+  'Los demás campos sirven para la historia clínica, pero no deben impedir agendar cuando el núcleo ya está completo.';
 
-    
+const entityHardRuleNote =
+  'Después de conocer el MOTIVO de la consulta, SIEMPRE debes pedir la entidad de salud o si es particular ' +
+  'ANTES de hablar de estudios, BI-RADS o disponibilidad de citas. ' +
+  'No avances al siguiente paso si aún no sabes la entidad. ' +
+  'Ejemplo: "¿Con qué seguro o entidad de salud cuentas, o prefieres atenderte como particular?".';
+
+
 
   session.history.push({ role: 'system', content: todayNote });
   session.history.push({ role: 'system', content: policyNote });
   session.history.push({ role: 'system', content: epsNote });
   session.history.push({ role: 'system', content: actionNote });
   session.history.push({ role: 'system', content: firstTimeNote });
+  session.history.push({ role: 'system', content: entityHardRuleNote }); // ⬅️ NUEVA
 
-  // Fijar tipo por mensaje explícito y guardar último texto
-  const explicitTipo = guessTipo(userMsg);
-  if (explicitTipo) session.tipoActual = explicitTipo;
-  session.lastUserText = userMsg;
+// Fijar tipo por mensaje explícito y guardar último texto
+const explicitTipo = guessTipo(userMsg);
+if (explicitTipo) {
+  session.tipoActual = normalizeTipo(explicitTipo);
+}
+session.lastUserText = userMsg;
 
   // Tomar datos del mensaje actual para ir llenando session.patient
-collectPatientFields(session, userMsg);
-const tipoEfectivo = session.tipoActual || guessTipo(userMsg) || '';
-// si no había tipo en sesión y lo inferimos, persístelo
-if (!session.tipoActual && tipoEfectivo) session.tipoActual = tipoEfectivo;
+  collectPatientFields(session, userMsg);
+  const paciente = ensurePatient(session);
 
-// ✅ Si ya está completo el núcleo de "Primera vez", NO volver a pedirlo
-if (/primera\s*vez/i.test(tipoEfectivo) && missingForTipo(session, 'Primera vez').length === 0) {
-  console.log('[PV] Núcleo COMPLETO para "Primera vez". No volver a pedir datos.');
-  session.history.push({
-    role: 'system',
-    content: 'Ya tengo TODOS los datos obligatorios del paciente para "Primera vez". NO los pidas de nuevo.'
-  });
-  // Flag para un auto-siguiente paso (mostrar disponibilidad)
+  // Tipo efectivo (raw) y normalizado
+  const tipoEfectivoRaw = session.tipoActual || guessTipo(userMsg) || '';
+  const tipoNorm = tipoEfectivoRaw ? normalizeTipo(tipoEfectivoRaw) : '';
+
+  // si no había tipo en sesión y lo inferimos, persístelo normalizado
+  if (tipoNorm) {
+    session.tipoActual = tipoNorm;
+  }
+
+  // 🔒 Inyectar nota de “ya tengo estos datos, no los pidas otra vez”
+  pushKnownPatientNote(session);
+
+  // 🚫 REGLA DURA: Coomeva Preferente no se atiende ni se agenda
   session.flags = session.flags || {};
-  session.flags.firstTimeCoreReady = true;
-}
 
-  
+  const textoEntidad = [
+    paciente.entidad_salud || '',
+    userMsg || ''
+  ].join(' ');
 
-// ✅ Cancelación por chat HABILITADA: guía al LLM, pero NO respondas aquí
-const cancelIntent = /\b(cancelar|anular|reprogramar|cambiar|modificar|mover)\b[\s\S]{0,60}\b(cita|turno|reserva)\b/i.test(userMsg);
-if (cancelIntent) {
-  session.history.push({
-    role: 'system',
-    content: [
-      'CANCELACIÓN HABILITADA POR CHAT.',
-      'Flujo: 1) pide CÉDULA (señuelo, no validar),',
-      '2) pide FECHA (AAAA-MM-DD) y HORA exacta (HH:mm, 24h),',
-      '3) emite SOLO un JSON: {"action":"cancelar_cita","data":{"cedula":"...","fecha":"AAAA-MM-DD","hora":"HH:mm"}}',
-      'No mezcles texto y JSON en el mismo mensaje y no confirmes hasta respuesta del sistema.',
-      'Si el sistema dice que NO se encontró o falta hora exacta → ahí sí responde con el número de Deivis.'
-    ].join(' ')
-  });
-  // OJO: no hacemos return aquí
-}
+  if (!session.flags.coomevaPreferenteNotified && isCoomevaPreferente(textoEntidad)) {
+    session.flags.coomevaPreferenteNotified = true;
+
+    const reply =
+      'En este momento *NO podemos atender ni agendar citas* para pacientes con el plan **Coomeva Preferente**. ' +
+      'Te pedimos disculpas por las molestias.\n\n' +
+      'Para recibir más información sobre tus opciones de atención, por favor comunícate directamente con nuestro asesor *Deivis* al +57 3108611759.';
+      
+
+    session.history.push({ role: 'assistant', content: reply });
+    capHistory(session);
+    touchSession(session);
+    return res.json({ reply, makeResponse: null });
+  }
+
+  // ✅ NOTA POSITIVA: Coomeva NO-PREFERENTE (oro, oro plus, etc.) SÍ se atiende
+  const entidadCanon = normalizeEntidadSalud(paciente.entidad_salud || userMsg);
+  const textoPlan = [
+    paciente.plan || '',
+    userMsg || ''
+  ].join(' ').toLowerCase();
+
+  const tienePalabraPreferente = /\bpreferent(e|es)?\b/.test(textoPlan);
+
+  if (entidadCanon === 'Coomeva' && !tienePalabraPreferente) {
+    session.history.push({
+      role: 'system',
+      content:
+        'El paciente tiene Coomeva *NO-PREFERENTE* (por ejemplo "oro", "oro plus", "medicina prepagada", "tradicional"). ' +
+        'NO digas que no se puede atender su plan, ni lo mezcles con Coomeva Preferente. ' +
+        'Trátalo como Coomeva válido y sigue el flujo normal de agendamiento.'
+    });
+  }
+
+  // ✅ Si ya está completo el núcleo de "Primera vez", NO volver a pedirlo
+  if (/primera\s*vez/i.test(tipoNorm) && missingForTipo(session, 'Primera vez').length === 0) {
+    console.log('[PV] Núcleo COMPLETO para "Primera vez". No volver a pedir datos.');
+    session.history.push({
+      role: 'system',
+      content: 'Ya tengo TODOS los datos obligatorios del paciente para "Primera vez". NO los pidas de nuevo.'
+    });
+    // Flag para un auto-siguiente paso (mostrar disponibilidad)
+    session.flags = session.flags || {};
+    session.flags.firstTimeCoreReady = true;
+  }
 
 
-
+  // ✅ Cancelación por chat HABILITADA: guía al LLM, pero NO respondas aquí
+  const cancelIntent = /\b(cancelar|anular|reprogramar|cambiar|modificar|mover)\b[\s\S]{0,60}\b(cita|turno|reserva)\b/i.test(userMsg);
+  if (cancelIntent) {
+    session.cancelling = true;  // ⬅️ IMPORTANTE
+    session.history.push({
+      role: 'system',
+      content: [
+        'CANCELACIÓN HABILITADA POR CHAT.',
+        'Flujo: 1) pide CÉDULA (señuelo, no validar),',
+        '2) pide FECHA (AAAA-MM-DD) y HORA exacta (HH:mm, 24h),',
+        '3) emite SOLO un JSON: {"action":"cancelar_cita","data":{"cedula":"...","fecha":"AAAA-MM-DD","hora":"HH:mm"}}',
+        'No mezcles texto y JSON en el mismo mensaje y no confirmes hasta respuesta del sistema.',
+        'Si el sistema dice que NO se encontró o falta hora exacta → ahí sí responde con el número de Deivis.'
+      ].join(' ')
+    });
+    // OJO: no hacemos return aquí
+  }
 
   if (session.birads) {
     session.history.push({
@@ -3329,151 +3479,103 @@ if (cancelIntent) {
   // Mensaje del usuario
   session.history.push({ role: 'user', content: userMsg });
   capHistory(session);
-  touchSession(session); 
+  touchSession(session);  // aquí actualizas el TTL de la sesión
+
   try {
-   // ===== LLM con guard =====
-   const completion = await callLLMWithGuard(session.history, {
-    model: 'gpt-4o',
-    temperature: 0.4,
-    // max_tokens: 600,  // opcional si quieres acotar presupuesto
-    retries: 3,          // 1º intenta gpt-4o, 2º gpt-4o-mini, 3º reintenta
-   });
+    // ===== LLM con guard =====
+    const completion = await callLLMWithGuard(session.history, {
+      model: 'gpt-4o',
+      temperature: 0.4,
+      // max_tokens: 600,
+      retries: 3,
+    });
 
-   const replyRaw = completion.choices?.[0]?.message?.content || '';
-   const actionResult = await maybeHandleAssistantAction(replyRaw, session);
+    const replyRaw = completion.choices?.[0]?.message?.content || '';
+    const actionResult = await maybeHandleAssistantAction(replyRaw, session);
 
-   // Texto visible (sin JSON ni bloques)
-   let reply = stripActionBlocks(replyRaw);
+    // Texto visible (sin JSON ni bloques)
+    let reply = stripActionBlocks(replyRaw);
 
-    // ========== Si hubo acciones, formatear según resultado real ==========
-   // ========= Si hubo acciones, ARMAR RESPUESTA SÓLO CON RESULTADOS =========
-   if(actionResult?.handled && actionResult.makeResponse) {
-   const mr = Array.isArray(actionResult.makeResponse)
-    ? actionResult.makeResponse
-    : [actionResult.makeResponse];
+    // ========= Si hubo acciones, ARMAR RESPUESTA SÓLO CON RESULTADOS =========
+    if (actionResult?.handled && actionResult.makeResponse) {
+      const mr = Array.isArray(actionResult.makeResponse)
+        ? actionResult.makeResponse
+        : [actionResult.makeResponse];
 
-   const errors    = mr.filter(x => x && x.ok === false);
-   const cancelled = mr.find(x => x && x.cancelled === true);
-   const daysResp  = mr.find(x => Array.isArray(x?.dias_disponibles));
-   const daySlots  = mr.find(x => Array.isArray(x?.slots));
-   const created   = mr.find(x => x && x.ok === true && (x.eventId || x.confirmText));
-   const saved     = mr.find(x => x && x.saved === true);
+      const errors    = mr.filter(x => x && x.ok === false);
+      const cancelled = mr.find(x => x && x.cancelled === true);
+      const daysResp  = mr.find(x => Array.isArray(x?.dias_disponibles));
+      const daySlots  = mr.find(x => Array.isArray(x?.slots));
+      const created   = mr.find(x => x && x.ok === true && (x.eventId || x.confirmText));
+      const saved     = mr.find(x => x && x.saved === true);
 
-   let reply = ''; // <- IMPORTANTE: partimos en blanco, NO usamos texto del modelo
+      reply = ''; // <- IMPORTANTE: partimos en blanco, NO usamos texto del modelo
 
-   if (cancelled) {
-    // Log y respuesta de éxito al paciente
-    console.log('[CANCEL][OK] Enviando confirmación de cancelación al paciente.');
-    reply = '✅ Tu cita fue cancelada correctamente. ¿Deseas **reprogramarla**? Puedo mostrarte la disponibilidad actual.';
-   } else if (errors.length) {
-    // Si hubo error real en la acción, mostramos errores (si quieres aquí puedes meter el fallback Deivis)
-    console.log('[CANCEL][ERR]', errors);
-    // Si el error fue “no_encontrada” o “falta_fecha_hora” → dar número de Deivis
-    const noEncontrada = errors.find(e => e?.error === 'no_encontrada' || /no_encontrad/i.test(e?.message||''));
-    const faltaHora    = errors.find(e => e?.error === 'falta_fecha_hora');
-    if (noEncontrada || faltaHora) {
-      reply = `No pude ubicar la cita con la información dada. Para cancelar o reprogramar, por favor comunícate con nuestro asesor *Deivis* al *${STAFF_DEIVIS_PHONE}*.`;
-    } else {
-      reply = errors.map(e => `⚠️ ${e.message || 'Operación no completada.'}`).join('\n\n');
-    }
-   } else if (created) {
-    if (created.confirmText) {
-      reply = created.confirmText;
-    } else {
-      const df = DateTime.fromISO(created.inicio || '', { zone: ZONE }).setLocale('es');
-      const fechaTxt = df.isValid ? df.toFormat("d 'de' LLLL") : 'la fecha indicada';
-      const horaTxt  = df.isValid ? df.toFormat('HH:mm') : 'la hora indicada';
-      reply =
-     `Tu cita ha sido agendada exitosamente para el ${fechaTxt} a las ${horaTxt} en la Clínica Portoazul, piso 7, consultorio 707, en Barranquilla.
+      if (cancelled) {
+        session.cancelling = false; // ⬅️ ya se canceló, salimos de modo cancelar
+        console.log('[CANCEL][OK] Enviando confirmación de cancelación al paciente.');
+        reply = '✅ Tu cita fue cancelada correctamente. ¿Deseas **reprogramarla**? Puedo mostrarte la disponibilidad actual.';
+      } else if (errors.length) {
+        console.log('[CANCEL][ERR]', errors);
+        const noEncontrada = errors.find(e => e?.error === 'no_encontrada' || /no_encontrad/i.test(e?.message || ''));
+        const faltaHora    = errors.find(e => e?.error === 'falta_fecha_hora');
+        if (noEncontrada || faltaHora) {
+          reply = `No pude ubicar la cita con la información dada. Para cancelar o reprogramar, por favor comunícate con nuestro asesor *Deivis* al +57 3108611759`;
+        } else {
+          reply = errors.map(e => `⚠️ ${e.message || 'Operación no completada.'}`).join('\n\n');
+        }
+      } else if (created) {
+        if (created.confirmText) {
+          reply = created.confirmText;
+        } else {
+          const df = DateTime.fromISO(created.inicio || '', { zone: ZONE }).setLocale('es');
+          const fechaTxt = df.isValid ? df.toFormat("d 'de' LLLL") : 'la fecha indicada';
+          const horaTxt  = df.isValid ? df.toFormat('HH:mm') : 'la hora indicada';
+          reply =
+            `Tu cita ha sido agendada exitosamente para el ${fechaTxt} a las ${horaTxt} en la Clínica Portoazul, piso 7, consultorio 707, en Barranquilla.
      Por favor, llega con 15 minutos de anticipación y lleva todos los reportes previos impresos.
      Recuerda que está prohibido grabar audio o video durante la consulta sin autorización. Cualquier inquietud adicional, no dudes en contactarnos.` +
-        (created.htmlLink ? `\n\nAbrir en Google Calendar: ${created.htmlLink}` : '');
+            (created.htmlLink ? `\n\nAbrir en Google Calendar: ${created.htmlLink}` : '');
+        }
+      } else if (saved) {
+        const auto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
+        reply = `He tomado tus datos. Pasemos a revisar la disponibilidad…\n\n${auto}`;
+      } else if (daySlots || daysResp) {
+        if (needEntidadBeforeDispon(session)) {
+        if (replyAskEntidad(res, session)) return; // ya respondimos y salimos
+        }
+        // Ignoramos la lista cruda que venga del modelo (slots o dias_disponibles)
+        const auto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
+        reply = auto;
+      }
+
+      reply = (reply || '').trim();
+      if (!reply) reply = 'Listo ✅';
+
+      console.log('[CHAT][FINAL-REPLY]', reply);
+
+      session.history.push({ role: 'assistant', content: reply });
+      capHistory(session);
+      touchSession(session);
+      return res.json({ reply, makeResponse: actionResult.makeResponse });
     }
-   } else if (saved) {
-    const auto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
-    reply = `He tomado tus datos. Pasemos a revisar la disponibilidad…\n\n${auto}`;
-   } else if (daySlots) {
-  if (!daySlots.slots.length) {
-    reply = `Para ${fmtFechaHumana(daySlots.fecha)} no hay cupos válidos. ¿Quieres otra fecha?`;
-  } else {
-    const fechaTxt = fmtFechaHumana(daySlots.fecha);
-    const horas = daySlots.slots.map(s => fmtHoraHumana(s.inicio)).join(', ');
-    reply = `Disponibilidad de citas — ${fechaTxt}:\n${horas}\n\n¿Te sirve alguna? Responde con la hora exacta (ej. "8:15").`;
-  }
-  // ⬇️ Guardar oferta
-  session.lastOffered = {
-    tipo: session.tipoActual || 'Control presencial',
-    days: [{ fechaISO: daySlots.fecha, slots: (daySlots.slots||[]).map(s => ({ inicio: s.inicio, fin: s.fin })) }],
-    singleDay: true
-  };
 
-} else if (daysResp) {
-  const listaIn = Array.isArray(daysResp.dias_disponibles) ? daysResp.dias_disponibles : [];
-  if (!listaIn.length) {
-    try {
-      const texto = await showAvailabilityNowBusinessStrict(session, DateTime.now().setZone(ZONE), { force: true });
-      reply = texto || '⚠️ No pude consultar la disponibilidad.';
+    // Si el modelo "prometió" consultar pero NO mandó acción JSON → mostrar disponibilidad
+    const promisedToCheck = /(consultar[ée]?\s+la\s+disponibilidad|voy\s+a\s+consultar\s+la\s+disponibilidad|proceder[eé]?\s+a\s+(verificar|revisar|buscar)\s+disponibilidad|voy\s+a\s+revisar\s+la\s+agenda|voy\s+a\s+revisar\s+el\s+pr[oó]ximo\s+cupo\s+disponible|voy\s+a\s+buscar\s+el\s+pr[oó]ximo\s+cupo\s+disponible|un\s+momento\s+mientras\s+reviso\s+el\s+pr[oó]ximo\s+cupo)/i.test(replyRaw);
 
-    } catch (e) {
-      console.error('❌ Disponibilidad (daysResp vacío) error:', e);
-      reply = '⚠️ No pude consultar la disponibilidad ahora. Intenta de nuevo en unos minutos.';
+    if (!actionResult?.handled && promisedToCheck) {
+         // ⛔ Si no hay EPS, no revises disponibilidad todavía
+       if (needEntidadBeforeDispon(session)) {
+       if (replyAskEntidad(res, session)) return; // ya respondimos y salimos
+       }
+      try {
+        const auto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
+        reply = auto;
+        console.log('[AUTO-DISPONIBILIDAD] sin acción JSON → enviada');
+      } catch (e) {
+        console.error('❌ Auto-disponibilidad error:', e);
+      }
     }
-  } else {
-    // si el modelo ya trajo lista, igual puedes normalizarla y mostrar TODO (sin cortar horas)
-    const byDate = new Map();
-    for (const d of listaIn) {
-      const k = d.fecha;
-      const prev = byDate.get(k);
-      const merged = (prev?.slots || []).concat(d.slots || []);
-      const seen = new Set();
-      const slots = merged
-        .filter(s => { const key = String(s.inicio); if (seen.has(key)) return false; seen.add(key); return true; })
-        .sort((a, b) => String(a.inicio).localeCompare(String(b.inicio)));
-      byDate.set(k, { fecha: k, slots });
-    }
-    const ordered = [...byDate.values()].filter(d => (d.slots || []).length > 0).sort((a,b)=>a.fecha.localeCompare(b.fecha));
-
-    // Aquí NO hacemos autorango ni ampliación, solo mostramos lo que vino:
-    const lineas = ordered.map(d => {
-      const fecha = fmtFechaHumana(d.fecha);
-      const horas = (d.slots || []).map(s => fmtHoraHumana(s.inicio)).join(', ');
-      return `- ${fecha}: ${horas}`;
-    }).join('\n');
-
-    reply = `Disponibilidad de citas:\n${lineas}\n\n¿Cuál eliges?`;
-  }
-}
-
-
-
-   reply = (reply || '').trim();
-   if (!reply) reply = 'Listo ✅';
-
-   // Traza para ver lo que se enviará
-   console.log('[CHAT][FINAL-REPLY]', reply);
-
-   session.history.push({ role: 'assistant', content: reply });
-   capHistory(session);
-   touchSession(session);
-   return res.json({ reply, makeResponse: actionResult.makeResponse });
-   }
-
-
-   // Si el modelo "prometió" consultar pero NO mandó acción JSON → mostrar disponibilidad
-const promisedToCheck =
-  /consultar[ée]? la disponibilidad|voy a consultar la disponibilidad|un momento,\s*por favor/i.test(replyRaw);
-
-if (!actionResult?.handled && promisedToCheck) {
-  try {
-    const auto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
-    reply = auto;
-    console.log('[AUTO-DISPONIBILIDAD] sin acción JSON → enviada');
-  } catch (e) {
-    console.error('❌ Auto-disponibilidad error:', e);
-  }
-}
-
-
 
     // Si el modelo “dice” que ya agendó pero no hubo acción real → frenar
     if (looksLikeFakeConfirmation(reply)) {
@@ -3481,139 +3583,173 @@ if (!actionResult?.handled && promisedToCheck) {
     }
 
     // Si el usuario envió una fecha explícita (YYYY-MM-DD o dd/mm/yyyy)
-const dateWanted = parseUserDate(userMsg);
-if (!actionResult?.handled && dateWanted) {
+   const dateWanted = parseUserDate(userMsg);
+
+// ⛔ NO disparar auto-disponibilidad por fecha mientras estamos cancelando
+if (!actionResult?.handled && dateWanted && !session.cancelling) {
+  
+    if (needEntidadBeforeDispon(session)) {
+    if (replyAskEntidad(res, session)) return;
+    }
   try {
     const tipo = session.tipoActual || 'Control presencial';
-    const day = await disponibilidadPorDias({ tipo, desdeISO: dateWanted, dias: 1 });
+    const dias = await disponibilidadPorDias({
+      tipo,
+      desdeISO: dateWanted,
+      dias: 1 // 🔒 solo ese día
+    });
 
-    if (!day.length || !(day[0].slots || []).length) {
+    if (!dias.length || !(dias[0].slots || []).length) {
       reply = `Para ${fmtFechaHumana(dateWanted)} no hay cupos válidos. ¿Quieres otra fecha?`;
     } else {
-      const horas = day[0].slots.map(s => fmtHoraHumana(s.inicio)).join(', ');
-      reply = `Disponibilidad de citas — ${fmtFechaHumana(dateWanted)}:\n${horas}\n\n¿Te sirve alguna? Responde con la hora exacta (ej. "8:15").`;
+      const day   = dias[0];
+      const slot  = day.slots[0]; // ⬅️ SOLO el primer cupo del día
+      const df    = DateTime.fromISO(slot.inicio, { zone: ZONE }).setLocale('es');
+      const fechaTxt = fmtFechaHumana(day.fecha);
+      const horaTxt  = df.toFormat('HH:mm');
+
+      reply =
+        `Tengo un cupo disponible ese día:\n` +
+        `📅 *${fechaTxt}* a las *${horaTxt}*.\n\n` +
+        `¿Deseas tomar esa hora?  ` +
+        `Si no te sirve, por ahora es la única disponible para ese día.`;
+
+      // Guardamos la oferta para que el auto-create pueda usarla
+      session.lastOffered = {
+        tipo: session.tipoActual || tipo,
+        singleDay: true,
+        days: [{
+          fechaISO: day.fecha,
+          slots: [{ inicio: slot.inicio, fin: slot.fin }]
+        }]
+      };
     }
+
     console.log('[AUTO-DISPONIBILIDAD-DÍA] fecha del usuario → enviada');
   } catch (e) {
     console.error('❌ Auto-disponibilidad por día error:', e);
   }
 }
 
-// === AUTO-CREAR SI EL USUARIO ELIGE UN HORARIO DE LOS ÚLTIMOS OFRECIDOS ===
-if (!actionResult?.handled && session.lastOffered && session.lastOffered.days?.length) {
-  const hhmm = extractHour(userMsg);
-  const dateFromMsg = parseUserDate(userMsg);
 
-  // Determinar fecha candidata
-  let chosenDay = null;
-  if (dateFromMsg) {
-    chosenDay = session.lastOffered.days.find(d => d.fechaISO === dateFromMsg);
-  } else if (session.lastOffered.singleDay) {
-    chosenDay = session.lastOffered.days[0];
-  }
+    // === AUTO-CREAR SI EL USUARIO ELIGE UN HORARIO DE LOS ÚLTIMOS OFRECIDOS ===
+    if (!actionResult?.handled && session.lastOffered && session.lastOffered.days?.length) {
+      const hhmm        = extractHour(userMsg);
+      const dateFromMsg = parseUserDate(userMsg);
 
-  // Si tenemos fecha y hora, buscar el slot
-  if (chosenDay && hhmm) {
-    const slot = (chosenDay.slots || []).find(s => {
-      const h = DateTime.fromISO(s.inicio, { zone: ZONE }).toFormat('HH:mm');
-      return h === hhmm;
-    });
+      let chosenDay = null;
+      if (dateFromMsg) {
+        chosenDay = session.lastOffered.days.find(d => d.fechaISO === dateFromMsg);
+      } else if (session.lastOffered.singleDay) {
+        chosenDay = session.lastOffered.days[0];
+      }
 
-    if (slot) {
-      // Validar núcleo (nombre, cédula, entidad_salud, correo, celular, dirección, ciudad)
-      const P = session.patient || {};
-      const core = ['nombre','cedula','entidad_salud','correo','celular','direccion','ciudad'];
-      const missingCore = core.filter(k => !String(P[k]||'').trim());
-      if (missingCore.length) {
-        reply = `Antes de agendar necesito: ${missingCore.join(', ')}. Por favor envíalos en un solo mensaje.`;
-      } else {
-        // Construir acción crear_cita y ejecutarla por la misma ruta
-        const payload = {
-          action: 'crear_cita',
-          data: {
-            nombre: P.nombre,
-            cedula: P.cedula,
-            entidad_salud: P.entidad_salud,
-            correo: P.correo,
-            celular: P.celular,
-            direccion: P.direccion,
-            ciudad: P.ciudad,
-            tipo: session.tipoActual || 'Control presencial',
-            inicio: slot.inicio,
-            fin: slot.fin
-          }
-        };
-        const block = '```action\n' + JSON.stringify(payload, null, 2) + '\n```';
-        const autoRes = await maybeHandleAssistantAction(block, session);
+      if (chosenDay && hhmm) {
+        const slot = (chosenDay.slots || []).find(s => {
+          const h = DateTime.fromISO(s.inicio, { zone: ZONE }).toFormat('HH:mm');
+          return h === hhmm;
+        });
 
-        if (autoRes?.handled && autoRes.makeResponse) {
-          const mr = Array.isArray(autoRes.makeResponse) ? autoRes.makeResponse : [autoRes.makeResponse];
-          const created = mr.find(x => x && x.ok === true && (x.eventId || x.confirmText));
-
-          if (created) {
-            // armar confirmación (mismo formato que ya usas)
-            if (created.confirmText) {
-              reply = created.confirmText;
-            } else {
-              const df = DateTime.fromISO(created.inicio || slot.inicio, { zone: ZONE }).setLocale('es');
-              const fechaTxt = df.isValid ? df.toFormat("d 'de' LLLL") : 'la fecha indicada';
-              const horaTxt  = df.isValid ? df.toFormat('HH:mm') : 'la hora indicada';
-              reply = `Tu cita ha sido agendada exitosamente para el ${fechaTxt} a las ${horaTxt} ` +
-                      `en la Clínica Portoazul, piso 7, consultorio 707, en Barranquilla. ` +
-                      `Por favor, llega con 15 minutos de anticipación y lleva todos los reportes previos impresos.\n\n` +
-                      `Recuerda que está prohibido grabar audio o video durante la consulta sin autorización. ` +
-                      `Cualquier inquietud adicional, no dudes en contactarnos.`;
-            }
-            console.log('[AUTO-CREATE] Cita creada desde selección de usuario.');
+        if (slot) {
+          const P = session.patient || {};
+          const core = ['nombre','cedula','entidad_salud','correo','celular','direccion','ciudad'];
+          const missingCore = core.filter(k => !String(P[k] || '').trim());
+          if (missingCore.length) {
+            reply = `Antes de agendar necesito: ${missingCore.join(', ')}. Por favor envíalos en un solo mensaje.`;
+          } else {
+                      // ❗ Validar Coomeva Preferente SOLO AQUÍ
+          if (isCoomevaPreferente(P.entidad_salud || '')) {
+            reply = 'En este momento no puedo agendar citas para pacientes con el plan Coomeva Preferente. ' +
+                    'Por favor, comunícate con nuestra oficina para revisar otras opciones.';
             session.history.push({ role: 'assistant', content: reply });
             capHistory(session);
             touchSession(session);
-            return res.json({ reply, makeResponse: autoRes.makeResponse });
+            return res.json({ reply, makeResponse: null });
+          }
+
+            const payload = {
+              action: 'crear_cita',
+              data: {
+                nombre:   P.nombre,
+                cedula:   P.cedula,
+                entidad_salud: P.entidad_salud,
+                correo:   P.correo,
+                celular:  P.celular,
+                direccion:P.direccion,
+                ciudad:   P.ciudad,
+                tipo:     session.tipoActual || 'Control presencial',
+                inicio:   slot.inicio,
+                fin:      slot.fin
+              }
+            };
+            const block   = '```action\n' + JSON.stringify(payload, null, 2) + '\n```';
+            const autoRes = await maybeHandleAssistantAction(block, session);
+
+            if (autoRes?.handled && autoRes.makeResponse) {
+              const mr = Array.isArray(autoRes.makeResponse) ? autoRes.makeResponse : [autoRes.makeResponse];
+              const created = mr.find(x => x && x.ok === true && (x.eventId || x.confirmText));
+
+              if (created) {
+                if (created.confirmText) {
+                  reply = created.confirmText;
+                } else {
+                  const df = DateTime.fromISO(created.inicio || slot.inicio, { zone: ZONE }).setLocale('es');
+                  const fechaTxt = df.isValid ? df.toFormat("d 'de' LLLL") : 'la fecha indicada';
+                  const horaTxt  = df.isValid ? df.toFormat('HH:mm') : 'la hora indicada';
+                  reply = `Tu cita ha sido agendada exitosamente para el ${fechaTxt} a las ${horaTxt} ` +
+                          `en la Clínica Portoazul, piso 7, consultorio 707, en Barranquilla. ` +
+                          `Por favor, llega con 15 minutos de anticipación y lleva todos los reportes previos impresos.\n\n` +
+                          `Recuerda que está prohibido grabar audio o video durante la consulta sin autorización. ` +
+                          `Cualquier inquietud adicional, no dudes en contactarnos.`;
+                }
+                console.log('[AUTO-CREATE] Cita creada desde selección de usuario.');
+                session.history.push({ role: 'assistant', content: reply });
+                capHistory(session);
+                touchSession(session);
+                return res.json({ reply, makeResponse: autoRes.makeResponse });
+              }
+            }
           }
         }
       }
     }
-  }
-}
 
-// 🔁 AUTO-DISPONIBILIDAD cuando es "Primera vez" y ya tengo núcleo
-if (
-  !actionResult?.handled &&
-  /primera\s*vez/i.test(session.tipoActual || '') &&
-  missingForTipo(session, 'Primera vez').length === 0 &&
-  !session.lastOffered // para no repetir si ya ofrecimos
-) {
-  try {
-    const replyAuto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
-    // Guardamos la última oferta en session.lastOffered dentro de showAvailabilityNow
-    console.log('[AUTO-DISPONIBILIDAD] Primera vez con núcleo completo → mostrando cupos');
-    session.history.push({ role: 'assistant', content: replyAuto });
-    capHistory(session); touchSession(session);
-    // Evitar que se dispare de nuevo en el mismo hilo
-    session.flags.firstTimeCoreReady = false;
-    return res.json({ reply: replyAuto, makeResponse: null });
-  } catch (e) {
-    console.error('❌ Auto-disponibilidad falló:', e);
-  }
-}
-
-
+    // 🔁 AUTO-DISPONIBILIDAD cuando es "Primera vez" y ya tengo núcleo
+    if (
+      !actionResult?.handled &&
+      /primera\s*vez/i.test(session.tipoActual || '') &&
+      missingForTipo(session, 'Primera vez').length === 0 &&
+      !session.lastOffered
+    ) {
+      try {
+        const replyAuto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
+        console.log('[AUTO-DISPONIBILIDAD] Primera vez con núcleo completo → mostrando cupos');
+        session.history.push({ role: 'assistant', content: replyAuto });
+        capHistory(session); touchSession(session);
+        session.flags.firstTimeCoreReady = false;
+        return res.json({ reply: replyAuto, makeResponse: null });
+      } catch (e) {
+        console.error('❌ Auto-disponibilidad falló:', e);
+      }
+    }
 
     // Fallback: si pidió disponibilidad en texto libre
     const u = userMsg.toLowerCase();
     const pideDispon = /disponibilidad|horarios|agenda|qué días|que dias|que horarios|que horario/.test(u);
     if (pideDispon) {
-  try {
-    const texto = await showAvailabilityNowBusinessStrict(session, DateTime.now().setZone(ZONE), { force: true });
-    reply = texto || '⚠️ No pude consultar la disponibilidad.';
 
-    reply = texto || '⚠️ No pude consultar la disponibilidad.';
-  } catch (e) {
-    console.error('❌ Fallback disponibilidad error:', e);
-    reply = '⚠️ No pude consultar la disponibilidad ahora. Intenta de nuevo en unos minutos.';
-  }
-}
+          if (needEntidadBeforeDispon(session)) {
+          if (replyAskEntidad(res, session)) return;
+          }
 
+      try {
+        const replyAuto = await showAvailabilityNow(session, now, _firstAllowedStart, _monthPolicyFrom);
+        console.log('[AUTO-DISPONIBILIDAD] Palabras clave de disponibilidad → usando showAvailabilityNow');
+        reply = replyAuto;
+      } catch (e) {
+        console.error('❌ Auto-disponibilidad (keywords) falló:', e);
+      }
+    }
 
     reply = stripActionBlocks(reply);
     if (!reply) reply = 'Listo ✅';
@@ -3621,14 +3757,14 @@ if (
     session.history.push({ role: 'assistant', content: reply });
     capHistory(session);
     touchSession(session);
-    res.json({ reply, makeResponse: null });
-  }catch (e) {
-  // En vez de escupir todo el error y devolver 500,
-  // desactivamos el chat y mandamos el mensaje al paciente.
-  const { reply } = await handleLLMFailureAndDisableChat(from, e);
-  return res.json({ reply });
-}
+    return res.json({ reply, makeResponse: null });
+
+  } catch (e) {
+    const { reply } = await handleLLMFailureAndDisableChat(from, e);
+    return res.json({ reply });
+  }
 });
+
 // ====== Endpoints directos para probar disponibilidad ======
 app.post('/availability', async (req, res) => {
   try {

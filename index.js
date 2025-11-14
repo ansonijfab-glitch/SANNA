@@ -27,7 +27,7 @@ import { fileURLToPath } from 'url';
 // Estado de WhatsApp para el panel
 let waQRDataUrl = null;       // data:image/png;base64,....
 let waQRUpdatedAt = 0;        // Date.now()
-let waUserJid = null;         // '5731xxxxxxx@s.whatsapp.net'
+let waUserJid = null;         // '5731xxxxxxx@s.whatsapp.nett'
 let waUserName = null;        // nombre opcional del dispositivo
 // ===== Logo (icono solo) como SVG servido por Express =====
 const LOGO_SVG = `
